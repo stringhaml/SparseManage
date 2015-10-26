@@ -8,6 +8,7 @@
 *.vcproj.filters            text eol=crlf
 *.vc[a-zA-Z]proj            text eol=crlf
 *.vc[a-zA-Z]proj.filters    text eol=crlf
+*.[sS][lL][nN]              text eol=crlf
 *.sh                        text eol=ln
 *.py                        text
 
