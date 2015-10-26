@@ -1,0 +1,17 @@
+*                           text=auto
+*.[cC]                      text
+*.[cC][pP][pP]              text
+*.[hH]                      text
+*.[hH][pP][pP]              text
+*.txt                       text
+*.vcproj                    text eol=crlf
+*.vcproj.filters            text eol=crlf
+*.vc[a-zA-Z]proj            text eol=crlf
+*.vc[a-zA-Z]proj.filters    text eol=crlf
+*.sh                        text eol=ln
+*.py                        text
+
+# no normalization
+*.pdf                       -text
+*.ps                        -text
+

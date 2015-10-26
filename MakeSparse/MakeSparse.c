@@ -332,7 +332,7 @@ int _tmain(int argc, _TCHAR **argv)
 		CloseHandle(ioctlOvrlpEvnts[i]);
 	}
 
-	_tprintf(_T("Completed processing file\n")); 
+	_tprintf(_T("Completed processing file\n"));
 
 	return 0;
 }

@@ -105,7 +105,7 @@ int _tmain(int argc, _TCHAR **argv)
 	if (0 == GetFileSizeEx(inFileHndl, &inFileSize)) {
 		abort();
 	}
-	
+
 	/* Set bytes remaining for loop termination */
 	bytsRemaining = inFileSize.QuadPart;
 
@@ -138,12 +138,12 @@ int _tmain(int argc, _TCHAR **argv)
 		if (0 == ReadFile(inFileHndl, nextBuf, CHUNK_SIZE, NULL, &inOvrlp) && GetLastError() != ERROR_IO_PENDING) {
 			abort();
 		}
-		
+
 		/* Look at results of last read */
 		for (i = 0; i < CHUNK_SIZE; i++) {
 			if (*(curBuf + i) != '\0') break;
 		}
-		
+
 		/* Determine if anything other than zeros was read */
 		if (i != CHUNK_SIZE) {
 			/* if so wait for the previous write to complete */
