@@ -3,7 +3,7 @@
 *.[cC][pP][pP]              text
 *.[hH]                      text
 *.[hH][pP][pP]              text
-*.txt                       text
+*.[tT][xX][tT]              text
 *.vcproj                    text eol=crlf
 *.vcproj.filters            text eol=crlf
 *.vc[a-zA-Z]proj            text eol=crlf
@@ -13,6 +13,6 @@
 *.py                        text
 
 # no normalization
-*.pdf                       -text
-*.ps                        -text
+*.[pP][dD][fF]              -text
+*.[pP][sS]                  -text
 

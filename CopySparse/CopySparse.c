@@ -10,12 +10,13 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#define DEFAULT_EXE_NAME    (TEXT("CopySparse.exe"))
 
 #define CHUNK_SIZE    (4 * 1024)
 //#define MAX_CONCURRENT_FILEOPS 1024
 
 /* Local helper functions */
-static void PrintUsageInfo();
+static void PrintUsageInfo(_TCHAR *exeName);
 //static int ParseParams(int argc, _TCHAR **argv, struct Params *params);
 
 int _tmain(int argc, _TCHAR **argv)
@@ -46,7 +47,7 @@ int _tmain(int argc, _TCHAR **argv)
 	char                    *nextBuf;
 
 	if (argc != 3) {
-		PrintUsageInfo();
+		PrintUsageInfo((argc < 1) ? DEFAULT_EXE_NAME : argv[0]);
 		return (EXIT_FAILURE);
 	}
 
@@ -231,9 +232,9 @@ int _tmain(int argc, _TCHAR **argv)
 	return (EXIT_SUCCESS);
 }
 
-static void PrintUsageInfo()
+static void PrintUsageInfo(_TCHAR *exeName)
 {
-	_tprintf(_T("Someday I should get around to telling you how to use this program\n"));
+	_tprintf(_T("Usage: %s INPUTFILE OUTPUTFILE\n"), exeName);
 
 	return;
 }
