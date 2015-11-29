@@ -176,7 +176,7 @@ static BOOL IsZeroBuf(LPVOID Buf, DWORD BufSz)
 	p = Buf;
 	e = p + BufSz;
 
-	while (*p++ == 0 && p < e);
+	while (*p == 0 && ++p < e);
 
 	return (p >= e) ? TRUE : FALSE;
 }
