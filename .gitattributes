@@ -11,6 +11,7 @@
 *.[sS][lL][nN]              text eol=crlf
 *.sh                        text eol=ln
 *.py                        text
+*.md                        text
 
 # no normalization
 *.[pP][dD][fF]              -text
