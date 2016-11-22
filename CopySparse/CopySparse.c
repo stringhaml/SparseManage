@@ -13,11 +13,9 @@
 #define DEFAULT_EXE_NAME    (TEXT("CopySparse.exe"))
 
 #define CHUNK_SIZE    (4 * 1024)
-//#define MAX_CONCURRENT_FILEOPS 1024
 
 /* Local helper functions */
 static void PrintUsageInfo(_TCHAR *exeName);
-//static int ParseParams(int argc, _TCHAR **argv, struct Params *params);
 
 int _tmain(int argc, _TCHAR **argv)
 {
@@ -188,6 +186,10 @@ int _tmain(int argc, _TCHAR **argv)
 	bytsRd += inByts;
 
 	/* Validate read size */
+	if (inByts > CHUNK_SIZE) {
+		abort();
+	}
+
 	if (inByts != bytsRemaining) {
 		_tprintf(_T("Warning: final read not of expected size. Read %lu expected %lld\n"), inByts, bytsRemaining);
 	}

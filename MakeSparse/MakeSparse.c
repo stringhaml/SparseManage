@@ -23,8 +23,7 @@
 
 /* TODO: Query existing sparse ranges and don't re-analyze them. */
 
-
-// TODO: Make this dynamic
+/* TODO: Make this dynamic */
 #define MAX_PENDING_IO      512
 
 
@@ -62,10 +61,8 @@ static VOID PrintUsageInfo()
 }
 
 
-/*
-Determine the cluster size of the file system that the handle resides on.
-Returns -1 on failure.
-*/
+/* Determine the cluster size of the file system that the handle resides on.
+ * Returns -1 on failure. */
 static SSIZE_T GetDriveClusterSize(
 	_In_    HANDLE      Fl
 	)
@@ -132,7 +129,7 @@ free_name_mem:
 }
 
 
-// TODO: Determine fastest portable zero analysis.
+/* TODO: Determine fastest portable zero analysis. */
 _Success_(return == TRUE)
 static BOOL IsZeroBuf(
 	_In_    LPVOID      Buf,
@@ -150,8 +147,8 @@ static BOOL IsZeroBuf(
 }
 
 
-// Note that if allocating an IO_READ the memory pointed to by ReadBuf is not
-// zeroed.
+/* Note that if allocating an IO_READ the memory pointed to by ReadBuf is not
+ * zeroed. */
 _Success_(return != NULL)
 static PIO_OP AllocIoOp(
 	_In_    enum IO_OP_TYPE     OpType,
@@ -323,8 +320,8 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 }
 
 
-// Helper function for single dispatch thread. Don't use with with multiple
-// dispatch threads.
+/* Helper function for single dispatch thread. Don't use with with multiple
+ * dispatch threads. */
 static VOID WaitAvailableIo(
 	_Inout_     PIO_CB_SHARED   IoCbCtx
 	)
@@ -420,9 +417,9 @@ static DWORD SetSparseRange(
 }
 
 
-// TODO: Definitively determine if this should send a zero ioctl for every
-// empty cluster or only for larger cluster groups. Also need to see if cluster
-// groups should be aligned.
+/* TODO: Definitively determine if this should send a zero ioctl for every
+ * empty cluster or only for larger cluster groups. Also need to see if cluster
+ * groups should be aligned. */
 static DWORD SetSparseRanges(
 	_Inout_     PIO_CB_SHARED       IoCbCtx,
 	_In_        PTP_IO              IoTp,
@@ -580,7 +577,6 @@ int _tmain(
 	PTP_IO                      pTpIo;
 	IO_CB_SHARED                ioCbCtx;
 	DWORD                       errRet;
-
 	volatile PLONG              zeroClusterMap;
 
 	idx = 1;
@@ -601,11 +597,17 @@ int _tmain(
 
 	_tprintf(_T("Cluster size: %ld\n"), (LONG)fsClusterSize);
 
-	zeroClusterMap = calloc(1, ((((flSz.QuadPart / fsClusterSize) / 32) + 1) * sizeof(LONG)));
+#ifdef _M_IX86
+	if (((((flSz.QuadPart / fsClusterSize) / 32) + 1) * sizeof(LONG)) >= INT32_MAX) {
+		_tprintf(_T("Insufficient addressable address space for file map. Use 64-bit build."));
+		ExitProcess(EXIT_FAILURE);
+	}
+#endif
+	zeroClusterMap = calloc(1, (SIZE_T)((((flSz.QuadPart / fsClusterSize) / 32) + 1) * sizeof(LONG)));
 	if (NULL == zeroClusterMap) {
 		CloseHandle(fl);
 		_tprintf(_T("Failed to allocate memory for cluster map\n"));
-		return EXIT_FAILURE;
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	ioCbCtx.FileHandle = fl;

@@ -11,12 +11,6 @@
 #include <assert.h>
 
 
-//#ifndef CONTAINING_RECORD
-//#define CONTAINING_RECORD(address, type, field) ((type *)( \
-//                                                  (PCHAR)(address) - \
-//                                                  (ULONG_PTR)(&((type *)0)->field)))
-//#endif
-
 #define S(x)        #x
 #define S_(x)       S(x)
 #define S_LINE_     S_(__LINE__)
@@ -32,12 +26,15 @@ struct WriteOp {
 };
 
 struct CleanupThreadParams {
-	volatile UINT32     *WriteOpsPending;
+	volatile LONG       *WriteOpsPending;
 	HANDLE              IOCompletionPort;
 };
 
 
-static struct WriteOp * AllocWriteOp(size_t BufSz)
+_Success_(return != NULL)
+static struct WriteOp * AllocWriteOp(
+	_In_        size_t      BufSz
+	)
 {
 	struct WriteOp *op;
 
@@ -63,7 +60,9 @@ static struct WriteOp * AllocWriteOp(size_t BufSz)
 	return op;
 }
 
-static void FreeWriteOp(struct WriteOp *Op)
+static void FreeWriteOp(
+	_In_    struct WriteOp  *Op
+	)
 {
 	assert(NULL != Op);
 
@@ -77,8 +76,11 @@ static void FreeWriteOp(struct WriteOp *Op)
 	free(Op);
 }
 
-/* Determine the cluster size of the file system that the handle resides on. */
-static DWORD GetDriveClusterSize(HANDLE hFl)
+/* Determine the cluster size of the file system that the handle resides on.
+ * Returns -1 on failure. */
+static SSIZE_T GetDriveClusterSize(
+	_In_    HANDLE      Fl
+	)
 {
 	DWORD   sectorsPerCluster;
 	DWORD   bytesPerSector;
@@ -86,24 +88,27 @@ static DWORD GetDriveClusterSize(HANDLE hFl)
 	DWORD   totalNumberOfClusters;
 	DWORD   flNameLen;
 	DWORD   tmp;
-	int     clusterSize;
+	SSIZE_T clusterSize;
 	int     delimCnt;
-	_TCHAR  *ofst;
-	_TCHAR  *flName;
+	TCHAR   *ofst;
+	TCHAR   *flName;
+
+	clusterSize = -1;
 
 	/* Determine buffer size to allocate. */
-	flNameLen = GetFinalPathNameByHandle(hFl, NULL, 0, VOLUME_NAME_GUID);
-	if (0 == flNameLen) {
-		/* TODO: Make this nice */
-		abort();
+	flNameLen = GetFinalPathNameByHandle(Fl, NULL, 0, VOLUME_NAME_GUID);
+	if (0 == flNameLen)
+		return clusterSize;
+
+	flName = calloc(1, sizeof(TCHAR) * (flNameLen + 1));
+	if (NULL == flName) {
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return clusterSize;
 	}
 
-	flName = calloc(1, sizeof(*flName) * (flNameLen + 1));
-
-	tmp = GetFinalPathNameByHandle(hFl, flName, flNameLen + 1, VOLUME_NAME_GUID);
-	if (0 == tmp || flNameLen < tmp) {
-		abort();
-	}
+	tmp = GetFinalPathNameByHandle(Fl, flName, flNameLen + 1, VOLUME_NAME_GUID);
+	if (0 == tmp || flNameLen < tmp)
+		goto free_name_mem;
 
 	// DEBUG
 	//_tprintf(_T("Filename: %s\n"), flName);
@@ -116,40 +121,42 @@ static DWORD GetDriveClusterSize(HANDLE hFl)
 	}
 
 	if (delimCnt != 4) {
-		//TODO: Handle nicely.
-		abort();
+		SetLastError(ERROR_DEVICE_FEATURE_NOT_SUPPORTED);
+		goto free_name_mem;
 	}
 
 	if ((flName + flNameLen) - ofst <= 0) {
-		//TODO: Handle nicely.
-		abort();
+		SetLastError(ERROR_DEVICE_FEATURE_NOT_SUPPORTED);
+		goto free_name_mem;
 	}
 
 	*ofst = _T('\0'); /* Terminate the string after last delimiter. */
 	//_tprintf(_T("Filename: %s\n"), flName);
 
-	if (0 == GetDiskFreeSpace(flName, &sectorsPerCluster, &bytesPerSector, &numberOfFreeClusters, &totalNumberOfClusters)) {
-		//TODO: Handle nicely.
-		abort();
-	}
-
-	free(flName);
+	if (FALSE == GetDiskFreeSpace(flName, &sectorsPerCluster, &bytesPerSector, &numberOfFreeClusters, &totalNumberOfClusters))
+		goto free_name_mem;
 
 	clusterSize = bytesPerSector * sectorsPerCluster;
 
+free_name_mem:
+	free(flName);
 	return (clusterSize);
 }
 
 
-static SSIZE_T FillBuf(HANDLE InputHndl, LPVOID Buf, DWORD BufSz)
+static SSIZE_T FillBuf(
+	_In_        HANDLE      InputHndl,
+	_Out_       LPVOID      Buf,
+	_In_        DWORD       BufSz
+	)
 {
 	DWORD       rdByts;
 	DWORD       err;
-	SSIZE_T     totalRd;
+	DWORD       totalRd;
 	BOOL        doLoop;
 
 	totalRd = 0;
-
+	doLoop = TRUE;
 	do {
 		if (0 == ReadFile(InputHndl, (char *)Buf + totalRd, BufSz - totalRd, &rdByts, NULL)) {
 			if (ERROR_BROKEN_PIPE == (err = GetLastError())) {
@@ -169,7 +176,10 @@ static SSIZE_T FillBuf(HANDLE InputHndl, LPVOID Buf, DWORD BufSz)
 
 
 // TODO: Determine fastest zero analysis.
-static BOOL IsZeroBuf(LPVOID Buf, DWORD BufSz)
+static BOOL IsZeroBuf(
+	_In_        LPVOID      Buf,
+	_In_        DWORD       BufSz
+	)
 {
 	char *p, *e;
 
@@ -190,7 +200,7 @@ static DWORD WINAPI CleanupThread(LPVOID Params)
 	LPOVERLAPPED                ovlpdPtr;
 	struct WriteOp              *curWriteOp;
 	struct CleanupThreadParams  *inParams;
-	volatile UINT32             *writeOpsPending;
+	volatile LONG               *writeOpsPending;
 
 	inParams = Params;
 	iocpHndl = inParams->IOCompletionPort;
@@ -227,17 +237,17 @@ int _tmain(int argc, _TCHAR **argv)
 	SIZE_T                      processedByts;
 	BOOL                        doLoop;
 	FILE_SET_SPARSE_BUFFER      setSparseBuf;
-	DWORD                       fsClusterSize;
+	SSIZE_T                     fsClusterSize;
 	ULARGE_INTEGER              tmpOfst;
 	LARGE_INTEGER               flSize;
 	DWORD                       err;
 	struct CleanupThreadParams  *tParams;
 	struct WriteOp              *curWriteOp;
-	volatile UINT32             writeOpsPending;
+	volatile LONG               writeOpsPending;
 
 	if (2 != argc) {
 		_ftprintf(stderr, _T("Invalid command line parameters\n"));
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	stdInHndl = GetStdHandle(STD_INPUT_HANDLE);
@@ -245,19 +255,23 @@ int _tmain(int argc, _TCHAR **argv)
 	outHndl = CreateFile(argv[1], GENERIC_ALL, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
 	if (INVALID_HANDLE_VALUE == outHndl) {
 		_ftprintf(stderr, _T("failed to create file %s with error %d.\n"), argv[2], GetLastError());
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	fsClusterSize = GetDriveClusterSize(outHndl);
 	if (fsClusterSize > MAX_MEMORY_USAGE) {
 		_ftprintf(stderr, _T("Cluster size of storage exceeds maximum allowed memory usage: %d\n"), MAX_MEMORY_USAGE);
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
+	}
+	if (fsClusterSize < 1) {
+		_ftprintf(stderr, _T("Failed to read cluster size of storage volume.\n"));
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	memset(&outOvrlp, 0, sizeof(outOvrlp));
 	if (NULL == (outOvrlp.hEvent = CreateEvent(NULL, TRUE, TRUE, NULL))) {
 		_ftprintf(stderr, _T("Failed to create event at: ") _T(S_LINE_) _T("\n"));
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	/* Set the sparse attribute for the file */
@@ -265,22 +279,22 @@ int _tmain(int argc, _TCHAR **argv)
 	if (0 == DeviceIoControl(outHndl, FSCTL_SET_SPARSE, &setSparseBuf, sizeof(setSparseBuf), NULL, 0, &outByts, &outOvrlp)
 		&& GetLastError() != ERROR_IO_PENDING) {
 		_ftprintf(stderr, _T("Failed to set sparse attribute\n"));
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	if (0 == GetOverlappedResult(outHndl, &outOvrlp, &outByts, TRUE)) {
 		_ftprintf(stderr, _T("Failed to set sparse attribute\n"));
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	if (NULL == (iocpHndl = CreateIoCompletionPort(outHndl, NULL, (ULONG_PTR)outHndl, 0))) {
 		_ftprintf(stderr, _T("Failed to allocate io completion port: ") _T(S_LINE_) _T("\n"));
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	if (NULL == (tParams = calloc(1, sizeof(*tParams)))) {
 		_ftprintf(stderr, _T("Memory allocation failure at: ") _T(S_LINE_) _T("\n"));
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	writeOpsPending = 0;
@@ -288,7 +302,7 @@ int _tmain(int argc, _TCHAR **argv)
 	tParams->WriteOpsPending = &writeOpsPending;
 	if (NULL == (cleanupThreadHndl = CreateThread(NULL, 0, CleanupThread, tParams, 0, NULL))) {
 		_ftprintf(stderr, _T("Failed to spawn cleanup thread: ") _T(S_LINE_) _T("\n"));
-		return (EXIT_FAILURE);
+		ExitProcess(EXIT_FAILURE);
 	}
 
 	processedByts = 0;
@@ -300,7 +314,7 @@ int _tmain(int argc, _TCHAR **argv)
 			ExitProcess(EXIT_FAILURE);
 		}
 
-		if (fsClusterSize != (bytsRd = FillBuf(stdInHndl, curWriteOp->Buf, curWriteOp->BufSz))) {
+		if (fsClusterSize != (bytsRd = FillBuf(stdInHndl, curWriteOp->Buf, (DWORD)curWriteOp->BufSz))) {
 			if (0 > bytsRd) {
 				_ftprintf(stderr, _T("stdin read failure with error: %ld\n"), GetLastError());
 				ExitProcess(EXIT_FAILURE);
@@ -310,7 +324,7 @@ int _tmain(int argc, _TCHAR **argv)
 
 		curWriteOp->BufUsed = bytsRd;
 
-		if (curWriteOp->BufUsed && (!IsZeroBuf(curWriteOp->Buf, curWriteOp->BufUsed))) {
+		if (curWriteOp->BufUsed && (!IsZeroBuf(curWriteOp->Buf, (DWORD)curWriteOp->BufUsed))) {
 			while ((writeOpsPending * fsClusterSize) >= MAX_MEMORY_USAGE) {
 				Sleep(1); // Wait for buffers to be freed by cleanup thead.
 			}
@@ -318,7 +332,7 @@ int _tmain(int argc, _TCHAR **argv)
 			tmpOfst.QuadPart                = processedByts;
 			curWriteOp->Ovrlp.Offset        = tmpOfst.LowPart;
 			curWriteOp->Ovrlp.OffsetHigh    = tmpOfst.HighPart;
-			if ((0 == WriteFile(outHndl, curWriteOp->Buf, curWriteOp->BufUsed, NULL, &curWriteOp->Ovrlp))
+			if ((0 == WriteFile(outHndl, curWriteOp->Buf, (DWORD)curWriteOp->BufUsed, NULL, &curWriteOp->Ovrlp))
 				&& (ERROR_IO_PENDING != (err = GetLastError()))) {
 				_ftprintf(stderr, _T("Failed to write to file with error: %ld\n"), err);
 				ExitProcess(EXIT_FAILURE);
@@ -344,7 +358,7 @@ int _tmain(int argc, _TCHAR **argv)
 		_ftprintf(stderr, _T("failed to get output file size with error: %ld\n"), GetLastError());
 		ExitProcess(EXIT_FAILURE);
 	}
-	if (flSize.QuadPart != processedByts) {
+	if (flSize.QuadPart != (LONGLONG)processedByts) {
 		flSize.QuadPart = processedByts;
 		if (0 == SetFilePointerEx(outHndl, flSize, NULL, FILE_BEGIN)) {
 			_ftprintf(stderr, _T("failed to move file pointer with error: %ld\n"), GetLastError());
