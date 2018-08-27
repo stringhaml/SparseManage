@@ -1,6 +1,6 @@
 /* Standard BSD license disclaimer.
 
-Copyright(c) 2016, Lance D. Stringham
+Copyright(c) 2016-2018, Lance D. Stringham
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -46,13 +46,15 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  * alignment. */
 
 /* TODO: Chunk file analysis and deallocation for files roughly 60 TiB or more
- * (assuming 4k clusters) since way may start running into memory issues with
+ * (assuming 4k clusters) since we may start running into memory issues with
  * only 2 GiB of usable memory in 32-bit environments. */
 
 /* TODO: Query existing sparse ranges and don't re-analyze them. */
 
 /* TODO: Make this dynamic */
-#define MAX_PENDING_IO      512
+#define MAX_PENDING_IO              512
+
+#define DEFAULT_FS_CLUSTER_SIZE     4096
 
 
 typedef struct IO_CP_CB_CTX {
@@ -320,8 +322,8 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 			}
 		} else {
 			_ftprintf(stderr,
-				_T("Error reading from file at offset 0x%08llX%08llX\n"),
-				(long long)pOvrlp->OffsetHigh, (long long)pOvrlp->Offset);
+				_T("Error 0x%08lX reading from file at offset 0x%08llX%08llX\n"),
+				IoResult, (long long)pOvrlp->OffsetHigh, (long long)pOvrlp->Offset);
 			// TODO: Make this nicer.
 			ExitProcess(EXIT_FAILURE);
 		}
@@ -330,8 +332,8 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 	case IO_SET_ZERO_RANGE:
 		if (ERROR_SUCCESS != IoResult) {
 			_ftprintf(stderr,
-				_T("Error in %s ioctl call at offset 0x%08llX%08llX\n"),
-				IO_SET_ZERO_RANGE == pIoOp->OpType ? _T("set zero range") : _T("set sparse attribute"),
+				_T("Error 0x%08lX in %s ioctl call at offset 0x%08llX%08llX\n"),
+				IoResult, IO_SET_ZERO_RANGE == pIoOp->OpType ? _T("set zero range") : _T("set sparse attribute"),
 				(long long)pOvrlp->OffsetHigh, (long long)pOvrlp->Offset);
 			// TODO: Make this nicer.
 			ExitProcess(EXIT_FAILURE);
@@ -477,7 +479,6 @@ static DWORD SetSparseRanges(
 				if (!((errRet == ERROR_IO_PENDING) || (errRet == ERROR_SUCCESS))) {
 					_ftprintf(stderr, _T("Error %#llx returned from SetSparseRange call.\n"), (long long)errRet);
 					ExitProcess(EXIT_FAILURE);
-
 				}
 			}
 			firstClusterInSequence = -1;
@@ -536,11 +537,13 @@ static DWORD SetSparseAttribute(
 
 
 // If NULL is returned caller may use GetLastError to find out what happened.
+// If FS Cluster size is not able to be determined then the parameter is set
+// to zero and GetLastError will return the underlying error.
 _Success_(return != NULL)
 static HANDLE OpenFileOverlappedExclusive(
 	_In_        LPCTSTR         FlName,
 	_Out_       PLARGE_INTEGER  pFileSize,
-	_Out_       PSIZE_T         pFsClusterSize,
+	_Out_opt_   PSIZE_T         pFsClusterSize,
 	_Out_opt_   LPFILETIME      pCreationTime,
 	_Out_opt_   LPFILETIME      pLastAccessTime,
 	_Out_opt_   LPFILETIME      pLastWriteTime
@@ -549,6 +552,9 @@ static HANDLE OpenFileOverlappedExclusive(
 	HANDLE      fl;
 	SSIZE_T     fsClusterSize;
 	DWORD       err;
+	DWORD       nonFatalErr;
+
+	nonFatalErr = ERROR_SUCCESS;
 
 	fl = CreateFile(FlName,             // user supplied filename
 		GENERIC_READ | GENERIC_WRITE,   // read/write
@@ -562,11 +568,13 @@ static HANDLE OpenFileOverlappedExclusive(
 		return (NULL);
 	}
 
-	if ((fsClusterSize = GetDriveClusterSize(fl)) < 1) {
-		err = GetLastError();
-		CloseHandle(fl);
-		SetLastError(err);
-		return NULL;
+	if (NULL != pFsClusterSize) {
+		*pFsClusterSize = 0;
+		if ((fsClusterSize = GetDriveClusterSize(fl)) < 1) {
+			nonFatalErr = GetLastError();
+		} else {
+			*pFsClusterSize = (SIZE_T)fsClusterSize;
+		}
 	}
 
 	if (FALSE == GetFileTime(fl, pCreationTime, pLastAccessTime, pLastWriteTime)) {
@@ -583,7 +591,9 @@ static HANDLE OpenFileOverlappedExclusive(
 		return NULL;
 	}
 
-	*pFsClusterSize = (SIZE_T)fsClusterSize;
+	if (ERROR_SUCCESS != nonFatalErr) {
+		SetLastError(nonFatalErr);
+	}
 
 	return fl;
 }
@@ -617,17 +627,24 @@ int _tmain(
 		return (EXIT_FAILURE);
 	}
 
+	_tprintf(_T("Opening file %s\n"), argv[idx]);
+
 	fl = OpenFileOverlappedExclusive(argv[idx], &flSz, &fsClusterSize, &tmCrt, &tmAcc, &tmWrt);
 	if (NULL == fl) {
-		_tprintf(_T("Failed to open file %s with error %d\n"), argv[1], GetLastError());
+		_tprintf(_T("Failed to open file %s with error %#llx\n"), argv[idx], (long long)GetLastError());
 		return (EXIT_FAILURE);
 	}
 
-	_tprintf(_T("Cluster size: %ld\n"), (LONG)fsClusterSize);
+	if (fsClusterSize == 0) {
+		fsClusterSize = DEFAULT_FS_CLUSTER_SIZE;
+		_tprintf(_T("Unable to determine cluster size of file system. Using default cluster size: %ld\n"), (LONG)fsClusterSize);
+	} else {
+		_tprintf(_T("Cluster size: %ld\n"), (LONG)fsClusterSize);
+	}
 
 #ifdef _M_IX86
 	if (((((flSz.QuadPart / fsClusterSize) / 32) + 1) * sizeof(LONG)) >= INT32_MAX) {
-		_tprintf(_T("Insufficient addressable address space for file map. Use 64-bit build."));
+		_tprintf(_T("Insufficient addressable address space for file map. Use 64-bit build.\n"));
 		ExitProcess(EXIT_FAILURE);
 	}
 #endif
@@ -638,12 +655,12 @@ int _tmain(
 		ExitProcess(EXIT_FAILURE);
 	}
 
-	ioCbCtx.FileHandle = fl;
-	ioCbCtx.FileSize = flSz;
-	ioCbCtx.FsClusterSize = fsClusterSize;
-	ioCbCtx.PendingIo = 0;
-	ioCbCtx.ZeroClusterMap = zeroClusterMap;
-	ioCbCtx.IoAvailEvt = CreateEvent(NULL, TRUE, TRUE, NULL);
+	ioCbCtx.FileHandle      = fl;
+	ioCbCtx.FileSize        = flSz;
+	ioCbCtx.FsClusterSize   = fsClusterSize;
+	ioCbCtx.PendingIo       = 0;
+	ioCbCtx.ZeroClusterMap  = zeroClusterMap;
+	ioCbCtx.IoAvailEvt      = CreateEvent(NULL, TRUE, TRUE, NULL);
 	if (NULL == ioCbCtx.IoAvailEvt) {
 		_ftprintf(stderr, _T("Error %#llx from CreateEvent call.\n"),
 			(long long)GetLastError());
@@ -656,7 +673,7 @@ int _tmain(
 		ExitProcess(EXIT_FAILURE);
 	}
 
-	_tprintf(_T("Starting file analysis."));
+	_tprintf(_T("Starting file analysis.\n"));
 	errRet = DispatchFileReads(&ioCbCtx, pTpIo);
 	if (ERROR_SUCCESS != errRet) {
 		_ftprintf(stderr, _T("Error %#llx from DispatchFileReads call.\n"),
@@ -672,7 +689,7 @@ int _tmain(
 
 	// TODO: Don't blindly set this if no zero clusters detected.
 	errRet = SetSparseAttribute(&ioCbCtx, pTpIo);
-	if (ERROR_SUCCESS != errRet) {
+	if (!((ERROR_SUCCESS == errRet) || (ERROR_IO_PENDING == errRet))) {
 		_ftprintf(stderr, _T("Error %#llx from SetSparseAttribute call.\n"),
 			(long long)errRet);
 		ExitProcess(EXIT_FAILURE);
