@@ -480,7 +480,7 @@ static DWORD DispatchFileReads(
 		StartThreadpoolIo(IoTp);
 		ret = ReadFile(IoCbCtx->FileHandle, pIoOp->ReadBuf, (DWORD)bytesToRead, NULL, &pIoOp->Ovlp);
 		if ((FALSE == ret) && (ERROR_IO_PENDING != (lastErr = GetLastError()))) {
-			_ftprintf(stderr, _T("Error %#llx from ReadFile call.\n"), (long long)GetLastError());
+			_ftprintf(stderr, _T("Error %#llx from ReadFile call.\n"), (long long)lastErr);
 			ExitProcess(EXIT_FAILURE);
 
 		}
