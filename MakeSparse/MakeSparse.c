@@ -39,6 +39,12 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <assert.h>
 
+/* Disable warning for "nonstandard extension used: nameless struct/union"
+ * since it actually is standard in C11. Now if only Visual Studio 2015 could
+ * get to C99... Here's to hoping for better C standard support in the next
+ * version... */
+#pragma warning(disable:4201)
+
 /* TODO: For windows 8 / server 2012 use GetFileInformationByHandleEx function
  * to query OS about the file sector size and alignment rather then the current
  * method of parsing the file handle path to open a handle to the drive and
@@ -52,16 +58,23 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /* TODO: Query existing sparse ranges and don't re-analyze them. */
 
 /* TODO: Make this dynamic */
-#define MAX_PENDING_IO              512
+#define MAX_PENDING_IO              128
 
 #define DEFAULT_FS_CLUSTER_SIZE     4096
 
+/* Relative 10 seconds in 100nsec intervals */
+#define STATS_TIMER_INTERVAL        (-100000000ll)
 
 typedef struct IO_CP_CB_CTX {
 	HANDLE          FileHandle;
 	LARGE_INTEGER   FileSize;
 	SIZE_T          FsClusterSize;
 	HANDLE          IoAvailEvt;
+	HANDLE          StatsTimerHandle;
+	LARGE_INTEGER   StatsTimerIntervalIn100Nsec;
+	volatile LONG64 StatsIoReadBytes;
+	volatile LONG64 StatsIoZeroedBytes;
+	volatile LONG64 StatsBytesToZero;
 	volatile LONG   PendingIo;
 	volatile PLONG  ZeroClusterMap;
 } IO_CB_SHARED, *PIO_CB_SHARED;
@@ -88,6 +101,50 @@ static VOID PrintUsageInfo()
 {
 	// TODO: Make this better.
 	_tprintf(_T("MakeSparse.exe [-p] FileToMakeSparse\nSpecify -p to preserve file timestamps."));
+}
+
+
+static VOID PrintProgress(
+	_In_    PIO_CB_SHARED   IoCbShared
+	)
+{
+	double statsIoReadBytes;
+	double fileSize;
+	LONG64 statsIoZeroedBytes;
+	LONG64 statsBytesToZero;
+
+	fileSize = (double)IoCbShared->FileSize.QuadPart;
+	statsIoReadBytes = (double)IoCbShared->StatsIoReadBytes;
+	statsIoZeroedBytes = IoCbShared->StatsIoZeroedBytes;
+	statsBytesToZero = IoCbShared->StatsBytesToZero;
+
+	_tprintf(_T("%.2f%% reads complete. (%.2f MiB of %.2f MiB)\n"),
+		(statsIoReadBytes / fileSize) * 100.0,
+		statsIoReadBytes / 1048576.0,
+		fileSize / 1048576.0);
+	_tprintf(_T("%.2f MiB of %.2f MiB zeroed. (%lld B of %lld B)\n"),
+		(double)statsIoZeroedBytes / 1048576.0,
+		(double)statsBytesToZero / 1048576.0,
+		(long long)(statsIoZeroedBytes),
+		(long long)(statsBytesToZero));
+	_tprintf(_T("%ld pending IO operations.\n"), IoCbShared->PendingIo);
+}
+
+
+static VOID PrintProgressOnInterval(
+	_In_    PIO_CB_SHARED   IoCbShared
+	)
+{
+	DWORD waitRtn;
+
+	if (WAIT_OBJECT_0 == (waitRtn = WaitForSingleObject(IoCbShared->StatsTimerHandle, 0))) {
+		PrintProgress(IoCbShared);
+		SetWaitableTimer(IoCbShared->StatsTimerHandle, &IoCbShared->StatsTimerIntervalIn100Nsec, 0, NULL, NULL, FALSE);
+	} else if (waitRtn != WAIT_TIMEOUT) {
+		_ftprintf(stderr, _T("Unexpected error 0x%08lX in wait call for StatsTimerHandle\n"), waitRtn);
+		// TODO: Make this nicer.
+		ExitProcess(EXIT_FAILURE);
+	}
 }
 
 
@@ -159,7 +216,7 @@ free_name_mem:
 }
 
 
-/* TODO: Determine fastest portable zero analysis. */
+/* TODO: Determine fastest portable zero analysis. This works for now... */
 _Success_(return == TRUE)
 static BOOL IsZeroBuf(
 	_In_    LPVOID      Buf,
@@ -262,6 +319,7 @@ static VOID PrintClusterMap(
 	_tprintf(_T("\n"));
 }
 
+
 static VOID CALLBACK ProcessCompletedIoCallback(
 	_Inout_     PTP_CALLBACK_INSTANCE Instance,
 	_Inout_opt_ PVOID                 Context,
@@ -275,6 +333,8 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 	PIO_OP          pIoOp;
 	PIO_CB_SHARED   cbCtx;
 	LARGE_INTEGER   startOffset;
+	SIZE_T          i;
+	SIZE_T          fsClusterSize;
 
 	UNREFERENCED_PARAMETER(Instance);
 	UNREFERENCED_PARAMETER(pTpIo);
@@ -302,21 +362,26 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 	switch (pIoOp->OpType) {
 	case IO_READ:
 		if (ERROR_SUCCESS == IoResult && NumBytesTxd) {
-			for (SIZE_T i = 0; i < NumBytesTxd; i += cbCtx->FsClusterSize) {
-				if ((i + cbCtx->FsClusterSize) <= NumBytesTxd) {
-					if (IsZeroBuf(pIoOp->ReadBuf + i, (DWORD)cbCtx->FsClusterSize)) {
+			fsClusterSize = cbCtx->FsClusterSize;
+			InterlockedAdd64(&cbCtx->StatsIoReadBytes, (LONG64)NumBytesTxd);
+			for (i = 0; i < NumBytesTxd; i += fsClusterSize) {
+				if ((i + fsClusterSize) <= NumBytesTxd) {
+					if (IsZeroBuf(pIoOp->ReadBuf + i, (DWORD)fsClusterSize)) {
 						startOffset.LowPart = pOvrlp->Offset;
 						startOffset.HighPart = pOvrlp->OffsetHigh;
 						startOffset.QuadPart += i;
-						MarkZeroCluster(cbCtx->ZeroClusterMap, cbCtx->FsClusterSize, startOffset.QuadPart);
+						MarkZeroCluster(cbCtx->ZeroClusterMap, fsClusterSize, startOffset.QuadPart);
+						InterlockedAdd64(&cbCtx->StatsBytesToZero, (LONG64)fsClusterSize);
 					}
 				} else {
 					startOffset.LowPart = pOvrlp->Offset;
 					startOffset.HighPart = pOvrlp->OffsetHigh;
 					// check if EOF runt
 					if ((cbCtx->FileSize.QuadPart - startOffset.QuadPart) == (LONGLONG)NumBytesTxd) {
-						if (IsZeroBuf(pIoOp->ReadBuf + i, (DWORD)(NumBytesTxd - i)))
-							MarkZeroCluster(cbCtx->ZeroClusterMap, cbCtx->FsClusterSize, startOffset.QuadPart + i);
+						if (IsZeroBuf(pIoOp->ReadBuf + i, (DWORD)(NumBytesTxd - i))) {
+							MarkZeroCluster(cbCtx->ZeroClusterMap, fsClusterSize, startOffset.QuadPart + i);
+							InterlockedAdd64(&cbCtx->StatsBytesToZero, (LONG64)(NumBytesTxd - i));
+						}
 					}
 				}
 			}
@@ -328,8 +393,14 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 			ExitProcess(EXIT_FAILURE);
 		}
 		break;
-	case IO_SET_SPARSE:
+
 	case IO_SET_ZERO_RANGE:
+		if (ERROR_SUCCESS == IoResult) {
+			InterlockedAdd64(&cbCtx->StatsIoZeroedBytes,
+				(LONG64)(pIoOp->ZeroDataInfo.BeyondFinalZero.QuadPart - pIoOp->ZeroDataInfo.FileOffset.QuadPart));
+		}
+		/* FALL THROUGH */
+	case IO_SET_SPARSE:
 		if (ERROR_SUCCESS != IoResult) {
 			_ftprintf(stderr,
 				_T("Error 0x%08lX in %s ioctl call at offset 0x%08llX%08llX\n"),
@@ -414,7 +485,10 @@ static DWORD DispatchFileReads(
 
 		}
 		flOffset.QuadPart += bytesToRead;
+
+		PrintProgressOnInterval(IoCbCtx);
 	}
+
 	return ERROR_SUCCESS;
 }
 
@@ -426,19 +500,18 @@ static DWORD SetSparseRange(
 	_In_        LONGLONG            BeyondFinalZero
 	)
 {
-	FILE_ZERO_DATA_INFORMATION  fzdi;
 	DWORD                       errRet, tmp;
 	PIO_OP                      pIoOp;
 
 	pIoOp = AllocIoOp(IO_SET_ZERO_RANGE, 0, 0);
 	if (NULL == pIoOp)
 		return ERROR_NOT_ENOUGH_MEMORY;
-	fzdi.FileOffset.QuadPart = FileOffset;
-	fzdi.BeyondFinalZero.QuadPart = BeyondFinalZero;
+	pIoOp->ZeroDataInfo.FileOffset.QuadPart = FileOffset;
+	pIoOp->ZeroDataInfo.BeyondFinalZero.QuadPart = BeyondFinalZero;
 	WaitAvailableIo(IoCbCtx);
 	StartThreadpoolIo(IoTp);
-	if (!DeviceIoControl(IoCbCtx->FileHandle, FSCTL_SET_ZERO_DATA, &fzdi,
-			sizeof(fzdi), NULL, 0, &tmp, &pIoOp->Ovlp)) {
+	if (!DeviceIoControl(IoCbCtx->FileHandle, FSCTL_SET_ZERO_DATA, &pIoOp->ZeroDataInfo,
+			sizeof(pIoOp->ZeroDataInfo), NULL, 0, &tmp, &pIoOp->Ovlp)) {
 		errRet = GetLastError();
 	} else {
 		errRet = ERROR_SUCCESS;
@@ -483,6 +556,7 @@ static DWORD SetSparseRanges(
 			}
 			firstClusterInSequence = -1;
 		}
+		PrintProgressOnInterval(IoCbCtx);
 	}
 
 	runtBytes = IoCbCtx->FileSize.QuadPart % IoCbCtx->FsClusterSize;
@@ -513,6 +587,8 @@ static DWORD SetSparseAttribute(
 	DWORD                   errRet, tmp;
 	PIO_OP                  pIoOp;
 
+	WaitAvailableIo(IoCbCtx);
+
 	pIoOp = AllocIoOp(IO_SET_SPARSE, 0, 0);
 	if (NULL == pIoOp)
 		return ERROR_NOT_ENOUGH_MEMORY;
@@ -536,9 +612,9 @@ static DWORD SetSparseAttribute(
 }
 
 
-// If NULL is returned caller may use GetLastError to find out what happened.
-// If FS Cluster size is not able to be determined then the parameter is set
-// to zero and GetLastError will return the underlying error.
+/* If NULL is returned caller may use GetLastError to find out what happened.
+ * If FS cluster size is not able to be determined then the parameter is set
+ * to zero and GetLastError will return the underlying error. */
 _Success_(return != NULL)
 static HANDLE OpenFileOverlappedExclusive(
 	_In_        LPCTSTR         FlName,
@@ -617,6 +693,8 @@ int _tmain(
 	DWORD                       errRet;
 	volatile PLONG              zeroClusterMap;
 
+	memset(&ioCbCtx, 0, sizeof(ioCbCtx));
+
 	idx = 1;
 	prsvTm = FALSE;
 	if (argc == 3 && !_tcscmp(argv[1], _T("-p"))) {
@@ -655,10 +733,19 @@ int _tmain(
 		ExitProcess(EXIT_FAILURE);
 	}
 
+	/* create and set waitable timer for stats output */
+	ioCbCtx.StatsTimerIntervalIn100Nsec.QuadPart = STATS_TIMER_INTERVAL;
+	ioCbCtx.StatsTimerHandle = CreateWaitableTimer(NULL, TRUE, NULL);
+	if (NULL == ioCbCtx.StatsTimerHandle) {
+		CloseHandle(fl);
+		_tprintf(_T("Failed to allocate waitable timer for stats output with error %#llx\n"), (long long)GetLastError());
+		ExitProcess(EXIT_FAILURE);
+	}
+	SetWaitableTimer(ioCbCtx.StatsTimerHandle, &ioCbCtx.StatsTimerIntervalIn100Nsec, 0, NULL, NULL, FALSE);
+
 	ioCbCtx.FileHandle      = fl;
 	ioCbCtx.FileSize        = flSz;
 	ioCbCtx.FsClusterSize   = fsClusterSize;
-	ioCbCtx.PendingIo       = 0;
 	ioCbCtx.ZeroClusterMap  = zeroClusterMap;
 	ioCbCtx.IoAvailEvt      = CreateEvent(NULL, TRUE, TRUE, NULL);
 	if (NULL == ioCbCtx.IoAvailEvt) {
@@ -704,6 +791,8 @@ int _tmain(
 	}
 	WaitForThreadpoolIoCallbacks(pTpIo, FALSE);
 
+	_tprintf(_T("Zero ranges dispatches complete.\n"));
+
 	/* Reset modified and access timestamps if preserve filetimes specified */
 	if (TRUE == prsvTm) {
 		if (0 == SetFileTime(fl, NULL, &tmAcc, &tmWrt)) {
@@ -718,9 +807,14 @@ int _tmain(
 	/* Flush buffers on file */
 	FlushFileBuffers(fl);
 
+	PrintProgress(&ioCbCtx);
 	CloseHandle(fl);
+	CloseHandle(ioCbCtx.StatsTimerHandle);
+	CloseHandle(ioCbCtx.IoAvailEvt);
+	free(zeroClusterMap);
 
 	_tprintf(_T("Completed processing file\n"));
 
 	return EXIT_SUCCESS;
 }
+
