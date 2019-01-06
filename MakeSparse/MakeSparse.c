@@ -39,6 +39,8 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <assert.h>
 
+#define DEFAULT_EXE_NAME        (_T("MakeSparse.exe"))
+
 /* Disable warning for "nonstandard extension used: nameless struct/union"
  * since it actually is standard in C11. Now if only Visual Studio 2015 could
  * get to C99... Here's to hoping for better C standard support in the next
@@ -60,12 +62,14 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /* TODO: Make this dynamic */
 #define MAX_PENDING_IO              128
 
+/* This value will be used if the cluster size of the filesystem cannot be
+ * determined automatically. */
 #define DEFAULT_FS_CLUSTER_SIZE     4096
 
 /* Relative 10 seconds in 100nsec intervals */
 #define STATS_TIMER_INTERVAL        (-100000000ll)
 
-typedef struct IO_CP_CB_CTX {
+typedef struct IO_CB_SHARED {
 	HANDLE          FileHandle;
 	LARGE_INTEGER   FileSize;
 	SIZE_T          FsClusterSize;
@@ -97,10 +101,12 @@ typedef struct IO_OP {
 } IO_OP, *PIO_OP;
 
 
-static VOID PrintUsageInfo()
+static VOID PrintUsageInfo(
+	_In_    PTCHAR      ExeName
+	)
 {
 	// TODO: Make this better.
-	_tprintf(_T("MakeSparse.exe [-p] FileToMakeSparse\nSpecify -p to preserve file timestamps."));
+	_tprintf(_T("%s [-p] Path\\To\\FileToMakeSparse.ext\nSpecify -p to preserve file timestamps."), ExeName);
 }
 
 
@@ -331,7 +337,7 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 {
 	LPOVERLAPPED    pOvrlp;
 	PIO_OP          pIoOp;
-	PIO_CB_SHARED   cbCtx;
+	PIO_CB_SHARED   cbCtxShared;
 	LARGE_INTEGER   startOffset;
 	SIZE_T          i;
 	SIZE_T          fsClusterSize;
@@ -345,10 +351,10 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 		ExitProcess(EXIT_FAILURE);
 	}
 
-	cbCtx = Context;
+	cbCtxShared = Context;
 
-	InterlockedDecrement(&cbCtx->PendingIo);
-	SetEvent(cbCtx->IoAvailEvt);
+	InterlockedDecrement(&cbCtxShared->PendingIo);
+	SetEvent(cbCtxShared->IoAvailEvt);
 
 	if (NULL == Overlapped) {
 		_ftprintf(stderr, _T("Received unexpected NULL overlapped in io completion callback.\n"));
@@ -362,25 +368,25 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 	switch (pIoOp->OpType) {
 	case IO_READ:
 		if (ERROR_SUCCESS == IoResult && NumBytesTxd) {
-			fsClusterSize = cbCtx->FsClusterSize;
-			InterlockedAdd64(&cbCtx->StatsIoReadBytes, (LONG64)NumBytesTxd);
+			fsClusterSize = cbCtxShared->FsClusterSize;
+			InterlockedAdd64(&cbCtxShared->StatsIoReadBytes, (LONG64)NumBytesTxd);
 			for (i = 0; i < NumBytesTxd; i += fsClusterSize) {
 				if ((i + fsClusterSize) <= NumBytesTxd) {
 					if (IsZeroBuf(pIoOp->ReadBuf + i, (DWORD)fsClusterSize)) {
 						startOffset.LowPart = pOvrlp->Offset;
 						startOffset.HighPart = pOvrlp->OffsetHigh;
 						startOffset.QuadPart += i;
-						MarkZeroCluster(cbCtx->ZeroClusterMap, fsClusterSize, startOffset.QuadPart);
-						InterlockedAdd64(&cbCtx->StatsBytesToZero, (LONG64)fsClusterSize);
+						MarkZeroCluster(cbCtxShared->ZeroClusterMap, fsClusterSize, startOffset.QuadPart);
+						InterlockedAdd64(&cbCtxShared->StatsBytesToZero, (LONG64)fsClusterSize);
 					}
 				} else {
 					startOffset.LowPart = pOvrlp->Offset;
 					startOffset.HighPart = pOvrlp->OffsetHigh;
 					// check if EOF runt
-					if ((cbCtx->FileSize.QuadPart - startOffset.QuadPart) == (LONGLONG)NumBytesTxd) {
+					if ((cbCtxShared->FileSize.QuadPart - startOffset.QuadPart) == (LONGLONG)NumBytesTxd) {
 						if (IsZeroBuf(pIoOp->ReadBuf + i, (DWORD)(NumBytesTxd - i))) {
-							MarkZeroCluster(cbCtx->ZeroClusterMap, fsClusterSize, startOffset.QuadPart + i);
-							InterlockedAdd64(&cbCtx->StatsBytesToZero, (LONG64)(NumBytesTxd - i));
+							MarkZeroCluster(cbCtxShared->ZeroClusterMap, fsClusterSize, startOffset.QuadPart + i);
+							InterlockedAdd64(&cbCtxShared->StatsBytesToZero, (LONG64)(NumBytesTxd - i));
 						}
 					}
 				}
@@ -396,7 +402,7 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 
 	case IO_SET_ZERO_RANGE:
 		if (ERROR_SUCCESS == IoResult) {
-			InterlockedAdd64(&cbCtx->StatsIoZeroedBytes,
+			InterlockedAdd64(&cbCtxShared->StatsIoZeroedBytes,
 				(LONG64)(pIoOp->ZeroDataInfo.BeyondFinalZero.QuadPart - pIoOp->ZeroDataInfo.FileOffset.QuadPart));
 		}
 		/* FALL THROUGH */
@@ -424,22 +430,22 @@ static VOID CALLBACK ProcessCompletedIoCallback(
 /* Helper function for single dispatch thread. Don't use with with multiple
  * dispatch threads. */
 static VOID WaitAvailableIo(
-	_Inout_     PIO_CB_SHARED   IoCbCtx
+	_Inout_     PIO_CB_SHARED   IoCbShared
 	)
 {
 	DWORD   ret;
 	LONG    pendingIOs;
 
-	ret = WaitForSingleObject(IoCbCtx->IoAvailEvt, INFINITE);
+	ret = WaitForSingleObject(IoCbShared->IoAvailEvt, INFINITE);
 	if (WAIT_OBJECT_0 != ret) {
 		_ftprintf(stderr,
 			_T("Error %#llx in WaitForSingleObject while waiting for available IO op.\n"),
 			(long long)GetLastError());
 		ExitProcess(EXIT_FAILURE);
 	}
-	pendingIOs = InterlockedIncrement(&IoCbCtx->PendingIo);
+	pendingIOs = InterlockedIncrement(&IoCbShared->PendingIo);
 	if (MAX_PENDING_IO <= pendingIOs)
-		if (!ResetEvent(IoCbCtx->IoAvailEvt)) {
+		if (!ResetEvent(IoCbShared->IoAvailEvt)) {
 			_ftprintf(stderr, _T("Error %#llx resetting IoAvailEvt.\n"),
 				(long long)GetLastError());
 			ExitProcess(EXIT_FAILURE);
@@ -448,7 +454,7 @@ static VOID WaitAvailableIo(
 
 
 static DWORD DispatchFileReads(
-	_Inout_     PIO_CB_SHARED       IoCbCtx,
+	_Inout_     PIO_CB_SHARED       IoCbShared,
 	_In_        PTP_IO              IoTp
 	)
 {
@@ -464,9 +470,9 @@ static DWORD DispatchFileReads(
 	pageSize = sysInfo.dwPageSize;
 
 	flOffset.QuadPart = 0;
-	while (flOffset.QuadPart < IoCbCtx->FileSize.QuadPart) {
-		WaitAvailableIo(IoCbCtx);
-		pIoOp = AllocIoOp(IO_READ, IoCbCtx->FsClusterSize, pageSize);
+	while (flOffset.QuadPart < IoCbShared->FileSize.QuadPart) {
+		WaitAvailableIo(IoCbShared);
+		pIoOp = AllocIoOp(IO_READ, IoCbShared->FsClusterSize, pageSize);
 		if (NULL == pIoOp) {
 			_ftprintf(stderr, _T("Failed to allocate io op while dispatching file reads.\n"));
 			ExitProcess(EXIT_FAILURE);
@@ -474,11 +480,11 @@ static DWORD DispatchFileReads(
 
 		pIoOp->Ovlp.Offset = flOffset.LowPart;
 		pIoOp->Ovlp.OffsetHigh = flOffset.HighPart;
-		bytesToRead = IoCbCtx->FileSize.QuadPart - flOffset.QuadPart;
-		if (bytesToRead > IoCbCtx->FsClusterSize)
-			bytesToRead = IoCbCtx->FsClusterSize;
+		bytesToRead = IoCbShared->FileSize.QuadPart - flOffset.QuadPart;
+		if (bytesToRead > IoCbShared->FsClusterSize)
+			bytesToRead = IoCbShared->FsClusterSize;
 		StartThreadpoolIo(IoTp);
-		ret = ReadFile(IoCbCtx->FileHandle, pIoOp->ReadBuf, (DWORD)bytesToRead, NULL, &pIoOp->Ovlp);
+		ret = ReadFile(IoCbShared->FileHandle, pIoOp->ReadBuf, (DWORD)bytesToRead, NULL, &pIoOp->Ovlp);
 		if ((FALSE == ret) && (ERROR_IO_PENDING != (lastErr = GetLastError()))) {
 			_ftprintf(stderr, _T("Error %#llx from ReadFile call.\n"), (long long)lastErr);
 			ExitProcess(EXIT_FAILURE);
@@ -486,7 +492,7 @@ static DWORD DispatchFileReads(
 		}
 		flOffset.QuadPart += bytesToRead;
 
-		PrintProgressOnInterval(IoCbCtx);
+		PrintProgressOnInterval(IoCbShared);
 	}
 
 	return ERROR_SUCCESS;
@@ -494,7 +500,7 @@ static DWORD DispatchFileReads(
 
 
 static DWORD SetSparseRange(
-	_Inout_     PIO_CB_SHARED       IoCbCtx,
+	_Inout_     PIO_CB_SHARED       IoCbShared,
 	_In_        PTP_IO              IoTp,
 	_In_        LONGLONG            FileOffset,
 	_In_        LONGLONG            BeyondFinalZero
@@ -508,9 +514,9 @@ static DWORD SetSparseRange(
 		return ERROR_NOT_ENOUGH_MEMORY;
 	pIoOp->ZeroDataInfo.FileOffset.QuadPart = FileOffset;
 	pIoOp->ZeroDataInfo.BeyondFinalZero.QuadPart = BeyondFinalZero;
-	WaitAvailableIo(IoCbCtx);
+	WaitAvailableIo(IoCbShared);
 	StartThreadpoolIo(IoTp);
-	if (!DeviceIoControl(IoCbCtx->FileHandle, FSCTL_SET_ZERO_DATA, &pIoOp->ZeroDataInfo,
+	if (!DeviceIoControl(IoCbShared->FileHandle, FSCTL_SET_ZERO_DATA, &pIoOp->ZeroDataInfo,
 			sizeof(pIoOp->ZeroDataInfo), NULL, 0, &tmp, &pIoOp->Ovlp)) {
 		errRet = GetLastError();
 	} else {
@@ -524,7 +530,7 @@ static DWORD SetSparseRange(
  * empty cluster or only for larger cluster groups. Also need to see if cluster
  * groups should be aligned. */
 static DWORD SetSparseRanges(
-	_Inout_     PIO_CB_SHARED       IoCbCtx,
+	_Inout_     PIO_CB_SHARED       IoCbShared,
 	_In_        PTP_IO              IoTp,
 	_In_        DWORD               MinClusterGroup
 	)
@@ -534,20 +540,20 @@ static DWORD SetSparseRanges(
 	INT64                       firstClusterInSequence;
 	DWORD                       errRet;
 
-	fsClusterSize = IoCbCtx->FsClusterSize;
+	fsClusterSize = IoCbShared->FsClusterSize;
 	// numClusters may be off by one if filesize not a cluster size multiple.
 	// This is handled after loop.
-	numClusters = IoCbCtx->FileSize.QuadPart / IoCbCtx->FsClusterSize;
+	numClusters = IoCbShared->FileSize.QuadPart / IoCbShared->FsClusterSize;
 	firstClusterInSequence = -1;
 
 	for (i = 0; i < numClusters; ++i) {
-		if (IsMarkedZero(IoCbCtx->ZeroClusterMap, i)) {
+		if (IsMarkedZero(IoCbShared->ZeroClusterMap, i)) {
 			if (firstClusterInSequence < 0)
 				firstClusterInSequence = (INT64)i;
 		} else {
 			if ((firstClusterInSequence >= 0)
 				&& (MinClusterGroup <= (i - firstClusterInSequence))) {
-				errRet = SetSparseRange(IoCbCtx, IoTp, firstClusterInSequence * fsClusterSize,
+				errRet = SetSparseRange(IoCbShared, IoTp, firstClusterInSequence * fsClusterSize,
 					i * fsClusterSize);
 				if (!((errRet == ERROR_IO_PENDING) || (errRet == ERROR_SUCCESS))) {
 					_ftprintf(stderr, _T("Error %#llx returned from SetSparseRange call.\n"), (long long)errRet);
@@ -556,19 +562,19 @@ static DWORD SetSparseRanges(
 			}
 			firstClusterInSequence = -1;
 		}
-		PrintProgressOnInterval(IoCbCtx);
+		PrintProgressOnInterval(IoCbShared);
 	}
 
-	runtBytes = IoCbCtx->FileSize.QuadPart % IoCbCtx->FsClusterSize;
+	runtBytes = IoCbShared->FileSize.QuadPart % IoCbShared->FsClusterSize;
 	if (runtBytes) {
-		if (!IsMarkedZero(IoCbCtx->ZeroClusterMap, i)) {
+		if (!IsMarkedZero(IoCbShared->ZeroClusterMap, i)) {
 			runtBytes = 0;
 		}
 		// Don't bother zeroing a runt by itself.
 	}
 	if ((firstClusterInSequence >= 0)
 		&& (MinClusterGroup <= (i - firstClusterInSequence))) {
-		errRet = SetSparseRange(IoCbCtx, IoTp, firstClusterInSequence * fsClusterSize,
+		errRet = SetSparseRange(IoCbShared, IoTp, firstClusterInSequence * fsClusterSize,
 			(i * fsClusterSize) + runtBytes);
 		if (!((errRet == ERROR_IO_PENDING) || (errRet == ERROR_SUCCESS))) {
 			_ftprintf(stderr, _T("Error %#llx returned from SetSparseRange call.\n"), (long long)errRet);
@@ -580,14 +586,14 @@ static DWORD SetSparseRanges(
 
 
 static DWORD SetSparseAttribute(
-	_In_        PIO_CB_SHARED       IoCbCtx,
+	_In_        PIO_CB_SHARED       IoCbShared,
 	_In_        PTP_IO              IoTp
 	)
 {
 	DWORD                   errRet, tmp;
 	PIO_OP                  pIoOp;
 
-	WaitAvailableIo(IoCbCtx);
+	WaitAvailableIo(IoCbShared);
 
 	pIoOp = AllocIoOp(IO_SET_SPARSE, 0, 0);
 	if (NULL == pIoOp)
@@ -596,7 +602,7 @@ static DWORD SetSparseAttribute(
 	/* Set the sparse attribute for the file */
 	pIoOp->SetSparseBuf.SetSparse = TRUE;
 	StartThreadpoolIo(IoTp);
-	if (!DeviceIoControl(IoCbCtx->FileHandle,
+	if (!DeviceIoControl(IoCbShared->FileHandle,
 			FSCTL_SET_SPARSE,
 			&pIoOp->SetSparseBuf,
 			sizeof(pIoOp->SetSparseBuf),
@@ -689,19 +695,26 @@ int _tmain(
 	FILETIME                    tmWrt;
 	LARGE_INTEGER               flSz;
 	PTP_IO                      pTpIo;
-	IO_CB_SHARED                ioCbCtx;
+	IO_CB_SHARED                ioCbShared;
 	DWORD                       errRet;
 	volatile PLONG              zeroClusterMap;
 
-	memset(&ioCbCtx, 0, sizeof(ioCbCtx));
+	/* Check for funny business... */
+	if (argc < 1) {
+		PrintUsageInfo(DEFAULT_EXE_NAME);
+		return (EXIT_FAILURE);
+	}
 
+	memset(&ioCbShared, 0, sizeof(ioCbShared));
+
+	/* Get command line params. */
 	idx = 1;
 	prsvTm = FALSE;
 	if (argc == 3 && !_tcscmp(argv[1], _T("-p"))) {
 		idx = 2;
 		prsvTm = TRUE;
 	} else if (argc != 2) {
-		PrintUsageInfo();
+		PrintUsageInfo(argv[0]);
 		return (EXIT_FAILURE);
 	}
 
@@ -734,26 +747,26 @@ int _tmain(
 	}
 
 	/* create and set waitable timer for stats output */
-	ioCbCtx.StatsTimerIntervalIn100Nsec.QuadPart = STATS_TIMER_INTERVAL;
-	ioCbCtx.StatsTimerHandle = CreateWaitableTimer(NULL, TRUE, NULL);
-	if (NULL == ioCbCtx.StatsTimerHandle) {
+	ioCbShared.StatsTimerIntervalIn100Nsec.QuadPart = STATS_TIMER_INTERVAL;
+	ioCbShared.StatsTimerHandle = CreateWaitableTimer(NULL, TRUE, NULL);
+	if (NULL == ioCbShared.StatsTimerHandle) {
 		CloseHandle(fl);
 		_tprintf(_T("Failed to allocate waitable timer for stats output with error %#llx\n"), (long long)GetLastError());
 		ExitProcess(EXIT_FAILURE);
 	}
-	SetWaitableTimer(ioCbCtx.StatsTimerHandle, &ioCbCtx.StatsTimerIntervalIn100Nsec, 0, NULL, NULL, FALSE);
+	SetWaitableTimer(ioCbShared.StatsTimerHandle, &ioCbShared.StatsTimerIntervalIn100Nsec, 0, NULL, NULL, FALSE);
 
-	ioCbCtx.FileHandle      = fl;
-	ioCbCtx.FileSize        = flSz;
-	ioCbCtx.FsClusterSize   = fsClusterSize;
-	ioCbCtx.ZeroClusterMap  = zeroClusterMap;
-	ioCbCtx.IoAvailEvt      = CreateEvent(NULL, TRUE, TRUE, NULL);
-	if (NULL == ioCbCtx.IoAvailEvt) {
+	ioCbShared.FileHandle      = fl;
+	ioCbShared.FileSize        = flSz;
+	ioCbShared.FsClusterSize   = fsClusterSize;
+	ioCbShared.ZeroClusterMap  = zeroClusterMap;
+	ioCbShared.IoAvailEvt      = CreateEvent(NULL, TRUE, TRUE, NULL);
+	if (NULL == ioCbShared.IoAvailEvt) {
 		_ftprintf(stderr, _T("Error %#llx from CreateEvent call.\n"),
 			(long long)GetLastError());
 		ExitProcess(EXIT_FAILURE);
 	}
-	pTpIo = CreateThreadpoolIo(fl, ProcessCompletedIoCallback, &ioCbCtx, NULL);
+	pTpIo = CreateThreadpoolIo(fl, ProcessCompletedIoCallback, &ioCbShared, NULL);
 	if (NULL == pTpIo) {
 		_ftprintf(stderr, _T("Error %#llx from CreateThreadpoolIo call.\n"),
 			(long long)GetLastError());
@@ -761,7 +774,7 @@ int _tmain(
 	}
 
 	_tprintf(_T("Starting file analysis.\n"));
-	errRet = DispatchFileReads(&ioCbCtx, pTpIo);
+	errRet = DispatchFileReads(&ioCbShared, pTpIo);
 	if (ERROR_SUCCESS != errRet) {
 		_ftprintf(stderr, _T("Error %#llx from DispatchFileReads call.\n"),
 			(long long)errRet);
@@ -775,7 +788,7 @@ int _tmain(
 	_tprintf(_T("Completed file analysis. Starting to dispatch zero ranges to file system.\n"));
 
 	// TODO: Don't blindly set this if no zero clusters detected.
-	errRet = SetSparseAttribute(&ioCbCtx, pTpIo);
+	errRet = SetSparseAttribute(&ioCbShared, pTpIo);
 	if (!((ERROR_SUCCESS == errRet) || (ERROR_IO_PENDING == errRet))) {
 		_ftprintf(stderr, _T("Error %#llx from SetSparseAttribute call.\n"),
 			(long long)errRet);
@@ -783,7 +796,7 @@ int _tmain(
 	}
 	WaitForThreadpoolIoCallbacks(pTpIo, FALSE);
 
-	errRet = SetSparseRanges(&ioCbCtx, pTpIo, 1);
+	errRet = SetSparseRanges(&ioCbShared, pTpIo, 1);
 	if (ERROR_SUCCESS != errRet) {
 		_ftprintf(stderr, _T("Error %#llx from SetSparseRanges call.\n"),
 			(long long)errRet);
@@ -807,10 +820,10 @@ int _tmain(
 	/* Flush buffers on file */
 	FlushFileBuffers(fl);
 
-	PrintProgress(&ioCbCtx);
+	PrintProgress(&ioCbShared);
 	CloseHandle(fl);
-	CloseHandle(ioCbCtx.StatsTimerHandle);
-	CloseHandle(ioCbCtx.IoAvailEvt);
+	CloseHandle(ioCbShared.StatsTimerHandle);
+	CloseHandle(ioCbShared.IoAvailEvt);
 	free(zeroClusterMap);
 
 	_tprintf(_T("Completed processing file\n"));
