@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ImportGroup Label="PropertySheets" />
+  <PropertyGroup Label="UserMacros">
+    <MAJOR_VERSION>0</MAJOR_VERSION>
+    <MINOR_VERSION>1</MINOR_VERSION>
+    <PATCH_VERSION>0</PATCH_VERSION>
+    <BUILD_NUMBER>1</BUILD_NUMBER>
+    <COPYRIGHT_NAME_LONG>Lance D. Stringham</COPYRIGHT_NAME_LONG>
+    <COPYRIGHT_NAME_SHORT>Lance D. Stringham</COPYRIGHT_NAME_SHORT>
+    <COPYRIGHT_YEARS>2016-2020</COPYRIGHT_YEARS>
+  </PropertyGroup>
+  <PropertyGroup />
+  <ItemDefinitionGroup />
+  <ItemGroup />
+</Project>

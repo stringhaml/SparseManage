@@ -1,0 +1,64 @@
+#include <windows.h>
+#include <ntverp.h>
+
+// Undef things that we want to redefine
+#ifdef VER_FILEVERSION
+#undef VER_FILEVERSION
+#endif
+#ifdef VER_PRODUCTVERSION
+#undef VER_PRODUCTVERSION
+#endif
+#ifdef VER_FILEVERSION_STR
+#undef VER_FILEVERSION_STR
+#endif
+#ifdef VER_PRODUCTVERSION_STR
+#undef VER_PRODUCTVERSION_STR
+#endif
+#ifdef VER_LEGALCOPYRIGHT_STR
+#undef VER_LEGALCOPYRIGHT_STR
+#endif
+#ifdef VER_PRODUCTNAME_STR
+#undef VER_PRODUCTNAME_STR
+#endif
+#ifdef VER_FILEDESCRIPTION_STR
+#undef VER_FILEDESCRIPTION_STR
+#endif
+#ifdef VER_INTERNALNAME_STR
+#undef VER_INTERNALNAME_STR
+#endif
+#ifdef VER_FILEFLAGS
+#undef VER_FILEFLAGS
+#endif
+
+// Required defines.
+#define VER_FILETYPE        VFT_APP
+#define VER_FILESUBTYPE     0
+
+// Visual Studio is very buggy and can't pass quoted strings in the definition
+// lines or RC will puke so we have to resort to some silly macro wizardry...
+#define STRING_TO_STRING2(s)            #s
+#define STRING_TO_STRING(s)             STRING_TO_STRING2(s)
+#define GEN_VER_STRING2(w, x, y, z)     #w "." #x "." #y "." #z
+#define GEN_VER_STRING(w, x, y, z)      GEN_VER_STRING2(w, x, y, z)
+#define COPYRIGHT_NAME_LONG_STR         STRING_TO_STRING(COPYRIGHT_NAME_LONG)
+#define COPYRIGHT_NAME_SHORT_STR        STRING_TO_STRING(COPYRIGHT_NAME_SHORT)
+#define COPYRIGHT_YEARS_STR             STRING_TO_STRING(COPYRIGHT_YEARS)
+
+
+#define VER_FILEVERSION         MAJOR_VERSION,MINOR_VERSION,PATCH_VERSION,BUILD_NUMBER
+#define VER_PRODUCTVERSION      MAJOR_VERSION,MINOR_VERSION,PATCH_VERSION,BUILD_NUMBER
+#define VER_FILEVERSION_STR     GEN_VER_STRING(MAJOR_VERSION,MINOR_VERSION,PATCH_VERSION,BUILD_NUMBER)
+#define VER_PRODUCTVERSION_STR  VER_FILEVERSION_STR
+#define VER_LEGALCOPYRIGHT_STR  " \251 " COPYRIGHT_YEARS_STR " " COPYRIGHT_NAME_LONG_STR
+#define VER_PRODUCTNAME_STR     "SparseManage"
+#define VER_FILEDESCRIPTION_STR "SparseManage - " STRING_TO_STRING(ARTIFACT_NAME)
+#define VER_INTERNALNAME_STR    STRING_TO_STRING(ARTIFACT_NAME)
+
+// At some point I should add accounting for official vs. private builds...
+#ifdef _DEBUG
+#define VER_FILEFLAGS   VS_FF_DEBUG
+#else
+#define VER_FILEFLAGS   0
+#endif
+
+#include <common.ver>
