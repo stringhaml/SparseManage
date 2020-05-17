@@ -135,11 +135,11 @@ FreeWriteOp(
 	free(Op);
 }
 
-
+_Success_(return >= 1)
 static SSIZE_T
 FillBuf(
 	_In_        HANDLE      InputHndl,
-	_When_(return != -1, _Out_writes_bytes_(return))
+	_Out_writes_bytes_(BufSz)
 	            LPVOID      Buf,
 	_In_        DWORD       BufSz
 	)

@@ -374,6 +374,12 @@ wmain(
 	/* create and set waitable timer for stats output */
 	statsFreq.QuadPart = -100000000ll; /* 10 seconds */
 	statsTimer = CreateWaitableTimerW(NULL, TRUE, NULL);
+	if (!statsTimer) {
+		lastErr = GetLastError();
+		LogError(L"Failed CreateWaitableTimerW with lastErr %lu (0x%08lx)", lastErr, lastErr);
+		goto error_return;
+	}
+
 	SetWaitableTimer(statsTimer, &statsFreq, 0, NULL, NULL, FALSE);
 
 	sourceFileSizeMiB = (double)sourceFileSize.QuadPart / 1048576.0;
