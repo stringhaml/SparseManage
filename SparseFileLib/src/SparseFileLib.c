@@ -42,6 +42,9 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "SparseFileLib.h"
 
+// This gets initialized by SparseFileLibInit
+static UINT64 QPCFrequency;
+
 
 // internal type declarations that are hidden from consumers
 struct CLUSTER_MAP {
@@ -389,5 +392,95 @@ SetFileSize(
 
 func_return:
 	return lastErr;
+}
+
+
+UINT64 __stdcall
+GetQPCVal(
+	void
+	)
+{
+	LARGE_INTEGER tmp;
+	// Per MS docs this will always succeed on XP or later.
+	(void)QueryPerformanceCounter(&tmp);
+	return (UINT64)tmp.QuadPart;
+}
+
+
+_Use_decl_annotations_
+UINT64 __stdcall
+ElapsedQPCInHours(
+	UINT64 StartVal,
+	UINT64 EndVal
+	)
+{
+	return ((EndVal - StartVal) / (60 * 60)) / QPCFrequency;
+}
+
+
+_Use_decl_annotations_
+UINT64 __stdcall
+ElapsedQPCInMinutes(
+	UINT64 StartVal,
+	UINT64 EndVal
+	)
+{
+	return ((EndVal - StartVal) / 60) / QPCFrequency;
+}
+
+
+_Use_decl_annotations_
+UINT64 __stdcall
+ElapsedQPCInSeconds(
+	UINT64 StartVal,
+	UINT64 EndVal
+	)
+{
+	return (EndVal - StartVal) / QPCFrequency;
+}
+
+
+_Use_decl_annotations_
+UINT64 __stdcall
+ElapsedQPCInMillisec(
+	UINT64 StartVal,
+	UINT64 EndVal
+	)
+{
+	return ((EndVal - StartVal) * 1000) / QPCFrequency;
+}
+
+
+_Use_decl_annotations_
+UINT64 __stdcall
+ElapsedQPCInMicrosec(
+	UINT64 StartVal,
+	UINT64 EndVal
+	)
+{
+	return ((EndVal - StartVal) * 1000000) / QPCFrequency;
+}
+
+_Use_decl_annotations_
+UINT64 __stdcall
+ElapsedQPCInNanosec(
+	UINT64 StartVal,
+	UINT64 EndVal
+	)
+{
+	return ((EndVal - StartVal) * 1000000000) / QPCFrequency;
+}
+
+
+/* This will get called before the the user's main func */
+void __stdcall
+SparseFileLibInit(
+	void
+	)
+{
+	LARGE_INTEGER tmp;
+	// Per MS docs this will always succeed on XP or later.
+	(void)QueryPerformanceFrequency(&tmp);
+	QPCFrequency = (UINT64)tmp.QuadPart;
 }
 

@@ -43,165 +43,18 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <SparseFileLib.h>
 
-#define MAX_PENDING_IOS     128
 #define DEFAULT_EXE_NAME    L"CopySparse.exe"
 
-#ifndef PAGE_SIZE
-#define PAGE_SIZE 4096
-#endif
-
-/* Global variables */
-PCLUSTER_MAP    g_ClusterMap;
-HANDLE          g_TargetFile;
-DWORD           g_NumPendingIOs;
-UINT64          g_BytesRead;
-UINT64          g_BytesWritten;
-
-typedef struct IO_OP {
-	PVOID       AlignedBuf;
-	OVERLAPPED  Overlapped;
-} IO_OP, *PIO_OP;
-
-
-_Must_inspect_result_
-_Success_(return != NULL)
-static PIO_OP __fastcall
-AllocIoOp(
-	_In_range_(1, MAXDWORD) DWORD   BufSize
-	)
-{
-	PIO_OP ioOp;
-
-	ioOp = calloc(1, sizeof(*ioOp));
-	if (!ioOp) {
-		LogError(L"Failed calloc with errno %d", errno);
-		goto error_return;
-	}
-
-	ioOp->AlignedBuf = _aligned_malloc(BufSize, PAGE_SIZE);
-	if (!ioOp->AlignedBuf) {
-		LogError(L"Failed _aligned_malloc with errno %d", errno);
-		goto error_return;
-	}
-
-	/* Embed the original buffer size in the hEvent member since it's free for context use when
-	Read/WriteFileEx variants are used. */
-	ioOp->Overlapped.hEvent = (HANDLE)(ULONG_PTR)BufSize;
-
-	goto func_return;
-
-error_return:
-	if (ioOp) {
-		if (ioOp->AlignedBuf)
-			_aligned_free(ioOp->AlignedBuf);
-		free(ioOp);
-		ioOp = NULL;
-	}
-	SetLastError(ERROR_OUTOFMEMORY);
-
-func_return:
-	return ioOp;
-}
-
-
-static void __fastcall
-FreeIoOp(
-	_In_ _Post_invalid_ PIO_OP IoOp
-	)
-{
-	_aligned_free(IoOp->AlignedBuf);
-	free(IoOp);
-}
-
-
-static void WINAPI
-TargetWriteComplete(
-	_In_    DWORD dwErrorCode,
-	_In_    DWORD dwNumberOfBytesTransfered,
-	_Inout_ LPOVERLAPPED lpOverlapped
-	)
-{
-	PIO_OP  ioOp;
-	UINT64  offset;
-	DWORD   writeLength;
-
-	ioOp        = CONTAINING_RECORD(lpOverlapped, IO_OP, Overlapped);
-	writeLength = (DWORD)(ULONG_PTR)lpOverlapped->hEvent;
-	offset      = lpOverlapped->Offset | ((UINT64)lpOverlapped->OffsetHigh << 32);
-
-	if (ERROR_SUCCESS != dwErrorCode) {
-		LogError(L"Failed write to target file at offset 0x%llx of length %lu with error code %lu", offset, writeLength, dwErrorCode);
-		// TODO: make this better
-		ExitProcess(EXIT_FAILURE);
-	}
-
-	if (dwNumberOfBytesTransfered != writeLength) {
-		LogError(L"Failed to write expected length %lu to target file at offset 0x%llx", writeLength, offset);
-		// TODO: make this better
-		ExitProcess(EXIT_FAILURE);
-	}
-
-	FreeIoOp(ioOp);
-	g_NumPendingIOs--;
-	g_BytesWritten += dwNumberOfBytesTransfered;
-}
-
-
-static void WINAPI
-SourceReadComplete(
-	_In_    DWORD dwErrorCode,
-	_In_    DWORD dwNumberOfBytesTransfered,
-	_Inout_ LPOVERLAPPED lpOverlapped
-	)
-{
-	PIO_OP  ioOp;
-	UINT64  offset;
-	DWORD   readLength, lastErr;
-
-	ioOp        = CONTAINING_RECORD(lpOverlapped, IO_OP, Overlapped);
-	readLength  = (DWORD)(ULONG_PTR)lpOverlapped->hEvent;
-	offset      = lpOverlapped->Offset | ((UINT64)lpOverlapped->OffsetHigh << 32);
-
-	if (ERROR_SUCCESS != dwErrorCode) {
-		LogError(L"Failed read from source file at offset 0x%llx of length %lu with error code %lu", lpOverlapped->Pointer, readLength, dwErrorCode);
-		// TODO: make this better
-		ExitProcess(EXIT_FAILURE);
-	}
-
-	if (readLength != dwNumberOfBytesTransfered) {
-		LogError(L"Failed to read expected number of bytes %lu from source file at offset 0x%llx of length %lu with error code %lu", readLength, lpOverlapped->Pointer, readLength, dwErrorCode);
-		// TODO: make this better
-		ExitProcess(EXIT_FAILURE);
-	}
-
-	/* If the buffer is zero we're done with it but if it's not we queue a write to the target file
-	 * using the same overlapped and buffer. */
-	if (IsZeroBuf(ioOp->AlignedBuf, dwNumberOfBytesTransfered)) {
-		FreeIoOp(ioOp);
-		g_NumPendingIOs--;
-		if (g_ClusterMap)
-			ClusterMapMarkZero(g_ClusterMap, offset);
-	} else {
-		/* Per docs MS won't modify overlapped offset values but we do need to clear the internal
-		values for overlapped re-use. */
-		lpOverlapped->Internal      = 0;
-		lpOverlapped->InternalHigh  = 0;
-		/* Per MS docs we always need to check GetLastError so we ignore the return value. */
-		(void)WriteFileEx(g_TargetFile,
-		                  ioOp->AlignedBuf,
-		                  dwNumberOfBytesTransfered,
-		                  lpOverlapped,
-		                  TargetWriteComplete);
-		lastErr = GetLastError();
-		if (ERROR_SUCCESS != lastErr) {
-			LogError(L"Failed WriteFileEx with lastErr %lu (0x%08lx)", lastErr, lastErr);
-			// TODO: make this better
-			ExitProcess(EXIT_FAILURE);
-		}
-	}
-
-	g_BytesRead += dwNumberOfBytesTransfered;
-}
+/* I came up with 512 MiB so the contiguous VA space required for file mappings
+ * would fit in both 32 and 64 bit processes. Since VA space is limited in
+ * 32-bit processes we need to be careful not to pick a value that is too large
+ * since Windows loads various libraries into the process memory and randomizes
+ * the address layout throughout the address space. There may be much better
+ * values that could be picked for 32-bit processes. I didn't spend any real
+ * time trying to find a good one and just picked it based on the factors noted
+ * above.
+*/
+#define MAX_FILE_VIEW_SIZE (512 * 1024 * 1024)
 
 
 static void __stdcall
@@ -209,7 +62,7 @@ PrintUsageInfo(
 	LPWSTR exeName
 	)
 {
-	LogInfo(L"Usage: %s [-h] [-m] INPUTFILE OUTPUTFILE\n\t-h Print this help message.\n\t-m Print sparse cluster map.\n", exeName);
+	LogInfo(L"Usage: %s [-h] [-m] INPUTFILE OUTPUTFILE\n\t-h Print this help message.\n", exeName);
 }
 
 
@@ -219,7 +72,6 @@ static BOOL __stdcall
 ParseArgs(
 	_In_    int         argc,
 	_In_    wchar_t     **argv,
-	_Out_   BOOLEAN     *PrintClusterMap,
 	_Out_   LPWSTR      *SourceFileName,
 	_Out_   LPWSTR      *TargetFileName
 	)
@@ -231,7 +83,7 @@ ParseArgs(
 	retVal = FALSE;
 	pcm = FALSE;
 
-	if ((argc < 3) || (argc > 5)) {
+	if ((argc < 3) || (argc > 4)) {
 		PrintUsageInfo((argc < 1) ? DEFAULT_EXE_NAME : argv[0]);
 		goto func_return;
 	}
@@ -240,15 +92,9 @@ ParseArgs(
 		if (!wcscmp(L"-h", argv[i])) {
 			PrintUsageInfo(argv[0]);
 			goto func_return;
-		} else if (!wcscmp(L"-m", argv[i])) {
-			/* catch if they specified -m twice. */
-			if (pcm)
-				goto func_return;
-			pcm = TRUE;
 		}
 	}
 
-	*PrintClusterMap = pcm;
 	*SourceFileName = argv[i];
 	*TargetFileName = argv[i + 1];
 	retVal = TRUE;
@@ -264,33 +110,45 @@ wmain(
 	wchar_t     **argv
 	)
 {
-	HANDLE                  sourceFile;
-	HANDLE                  statsTimer;
-	PIO_OP                  ioOp;
-	BOOLEAN                 printSparseMap;
 	LPWSTR                  sourceFileName, targetFileName;
+	HANDLE                  sourceFile, targetFile;
+	HANDLE                  sourceFileMap, targetFileMap;
+	char                    *sourceViewBase, *targetViewBase;
+	SIZE_T                  currentMapSize, currentMapAlignedDownSize, i;
+	UINT64                  bytesProcessed, startQPC;
 	FILETIME                ftCreate, ftAccess, ftWrite;
 	FILE_SET_SPARSE_BUFFER  sparseBuf;
 	LARGE_INTEGER           sourceFileSize, statsFreq;
-	ULARGE_INTEGER          currentOffset;
-	SIZE_T                  sourceClusterSize;
+	UINT64                  hours, minutes, seconds;
+	HANDLE                  statsTimer;
 	DWORD                   lastErr;
-	OVERLAPPED              setSparseOverlapped;
 	double                  sourceFileSizeMiB;
 	int                     retVal;
+	ULONG_PTR               tmpULP;
+	char                    tmpChar;
 
-	sourceFile = NULL;
-	statsTimer = NULL;
-	RtlZeroMemory(&setSparseOverlapped, sizeof(setSparseOverlapped));
+	SparseFileLibInit();
 
-	if (!ParseArgs(argc, argv, &printSparseMap, &sourceFileName, &targetFileName)) {
+	sourceFile      = NULL;
+	targetFile      = NULL;
+	sourceFileMap   = NULL;
+	targetFileMap   = NULL;
+	sourceViewBase  = NULL;
+	targetViewBase  = NULL;
+	statsTimer      = NULL;
+
+	bytesProcessed  = 0;
+
+	startQPC = GetQPCVal();
+
+	if (!ParseArgs(argc, argv, &sourceFileName, &targetFileName)) {
 		goto error_return;
 	}
 
 	sourceFile = OpenFileExclusive(sourceFileName,
-	                               FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
+	                               FILE_FLAG_SEQUENTIAL_SCAN,
 	                               &sourceFileSize,
-	                               &sourceClusterSize,
+	                               NULL,
 	                               &ftCreate,
 	                               &ftAccess,
 	                               &ftWrite);
@@ -300,74 +158,69 @@ wmain(
 		goto error_return;
 	}
 
-	if (!sourceClusterSize) {
-		LogInfo(L"Unable to determine cluster size of source file volume. Defaulting to %d.\n", 4096);
-		sourceClusterSize = 4096;
-	}
+	sourceFileSizeMiB = (double)sourceFileSize.QuadPart / 1048576.0;
 
-	if (printSparseMap) {
-		g_ClusterMap = ClusterMapAllocate((DWORD)sourceClusterSize, (UINT64)sourceFileSize.QuadPart);
-		if (!g_ClusterMap) {
-			lastErr = GetLastError();
-			LogError(L"Failed ClusterMapAllocate with lastErr %lu (0x%08lx)", lastErr, lastErr);
-			goto error_return;
-		}
-	}
-
-	g_TargetFile = CreateFileW(targetFileName,
-	                           GENERIC_ALL,
-	                           0,
-	                           NULL,
-	                           CREATE_NEW,
-	                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-	                           sourceFile);
-	if (INVALID_HANDLE_VALUE == g_TargetFile) {
-		g_TargetFile = NULL;
+	targetFile = CreateFileW(targetFileName,
+	                         GENERIC_ALL,
+	                         0,
+	                         NULL,
+	                         CREATE_NEW,
+	                         FILE_ATTRIBUTE_NORMAL,
+	                         sourceFile);
+	if (INVALID_HANDLE_VALUE == targetFile) {
+		targetFile = NULL;
 		lastErr = GetLastError();
 		LogError(L"Failed CreateFileW for filename %s with lastErr %lu (0x%08lx)", targetFileName, lastErr, lastErr);
 		goto error_return;
 	}
 
-	setSparseOverlapped.hEvent = CreateEventW(NULL, TRUE, TRUE, NULL);
-	if (!setSparseOverlapped.hEvent) {
-		lastErr = GetLastError();
-		LogError(L"Failed CreateEventW with lastErr %lu (0x%08lx)", lastErr, lastErr);
-		goto error_return;
-	}
-
 	/* Set the sparse attribute on the target file */
 	sparseBuf.SetSparse = TRUE;
-	if (!DeviceIoControl(g_TargetFile,
+	if (!DeviceIoControl(targetFile,
 	                     FSCTL_SET_SPARSE,
 	                     &sparseBuf,
 	                     sizeof(sparseBuf),
 	                     NULL,
 	                     0,
 	                     NULL,
-	                     &setSparseOverlapped)) {
+	                     NULL)) {
 		lastErr = GetLastError();
-		if (lastErr != ERROR_IO_PENDING) {
-			LogError(L"Failed DeviceIoControl for FSCTL_SET_SPARSE with lastErr %lu (0x%08lx)", lastErr, lastErr);
-			goto error_return;
-		}
-	}
-
-	/* GetOverlappedResult requires a param for bytes returned, but for our case, we don't care so
-	 * lastErr is used as a tmp variable here. */
-	if (!GetOverlappedResult(g_TargetFile, &setSparseOverlapped, &lastErr, TRUE)) {
-		lastErr = GetLastError();
-		LogError(L"Failed GetOverlappedResult for DeviceIoControl for FSCTL_SET_SPARSE with lastErr %lu (0x%08lx)", lastErr, lastErr);
+		LogError(L"Failed DeviceIoControl for FSCTL_SET_SPARSE with lastErr %lu (0x%08lx)", lastErr, lastErr);
 		goto error_return;
 	}
 
-	/* we're done with our sparsefile overlapped. */
-	(void)CloseHandle(setSparseOverlapped.hEvent);
-	setSparseOverlapped.hEvent = NULL;
-
 	/* Set the target file size to match the source. */
-	lastErr = SetFileSize(g_TargetFile, sourceFileSize);
+	lastErr = SetFileSize(targetFile, sourceFileSize);
 	if (ERROR_SUCCESS != lastErr) {
 		LogError(L"Failed SetFileSize with lastErr %lu (0x%08lx)", lastErr, lastErr);
+		goto error_return;
+	}
+	/* Check if the source file is zero bytes. If it is we're done. Requesting
+	 * zero-byte mappings from CreateFileMap is an error. */
+	if (!sourceFileSize.QuadPart)
+		goto out_stats;
+
+	sourceFileMap = CreateFileMappingW(sourceFile,
+		NULL,
+		PAGE_READONLY,
+		0,
+		0,
+		NULL);
+	if (!sourceFileMap) {
+		lastErr = GetLastError();
+		LogError(L"Failed CreateFileMappingW with lastErr %lu (0x%08lx)", lastErr, lastErr);
+		goto error_return;
+	}
+
+	targetFileMap = CreateFileMappingW(targetFile,
+		NULL,
+		PAGE_READWRITE,
+		0,
+		0,
+		NULL);
+	if (!targetFileMap) {
+		lastErr = GetLastError();
+		LogError(L"Failed CreateFileMappingW with lastErr %lu (0x%08lx)", lastErr, lastErr);
 		goto error_return;
 	}
 
@@ -379,89 +232,138 @@ wmain(
 		LogError(L"Failed CreateWaitableTimerW with lastErr %lu (0x%08lx)", lastErr, lastErr);
 		goto error_return;
 	}
-
 	SetWaitableTimer(statsTimer, &statsFreq, 0, NULL, NULL, FALSE);
 
-	sourceFileSizeMiB = (double)sourceFileSize.QuadPart / 1048576.0;
-	currentOffset.QuadPart = 0;
-	while (currentOffset.QuadPart < (ULONGLONG)sourceFileSize.QuadPart) {
-		if (g_NumPendingIOs < MAX_PENDING_IOS) {
-			ioOp = AllocIoOp((DWORD)min(sourceClusterSize,
-			                             (((ULONGLONG)sourceFileSize.QuadPart
-			                                        - currentOffset.QuadPart))));
-			if (!ioOp) {
-				lastErr = GetLastError();
-				LogError(L"Failed AllocIoOp with lastErr %lu (0x%08lx)", lastErr, lastErr);
-				goto error_return;
-			}
+	/* Read the source and write to the target using a sliding window over the
+	 * files. This allows the OS to only allocate blocks for mapped segments we
+	 * actually wrote data to. It's fast for reading because there are zero
+	 * memory copies involved and Windows can simply DMA the data directly to a
+	 * physical page and map it to our address space. It's super fast for
+	 * writing because only pages we actually write to in the target VA window
+	 * get backed with a physical page and blocks allocated in the file system.
+	 * The kernel never needs to copy memory, or even map a system address, and
+	 * can simply DMA the physical page to disk whenever it decides to flush
+	 * it's dirty page cache. Of course if we're operating on a file over the
+	 * network or there are filter drivers scanning all IO (i.e. virus scanner)
+	 * then things aren't quite as efficient on the backend, but it's still way
+	 * better than using ReadFiles/WriteFile. */
+	while (bytesProcessed < (UINT64)sourceFileSize.QuadPart) {
+		currentMapSize = (SIZE_T)MIN(MAX_FILE_VIEW_SIZE, (UINT64)sourceFileSize.QuadPart - bytesProcessed);
+		currentMapAlignedDownSize = ALIGN_DOWN_BY(currentMapSize, sizeof(tmpULP));
 
-			ioOp->Overlapped.Offset     = currentOffset.LowPart;
-			ioOp->Overlapped.OffsetHigh = currentOffset.HighPart;
-			++g_NumPendingIOs;
-			/* Per MS docs we always need to check GetLastError so we ignore the return value. */
-			(void)ReadFileEx(sourceFile,
-			                 ioOp->AlignedBuf,
-			                 (DWORD)sourceClusterSize,
-			                 &ioOp->Overlapped,
-			                 SourceReadComplete);
+		sourceViewBase = MapViewOfFile(sourceFileMap,
+			FILE_MAP_READ,
+			(DWORD)(bytesProcessed >> 32),
+			(DWORD)bytesProcessed,
+			currentMapSize);
+		if (!sourceViewBase) {
 			lastErr = GetLastError();
-			if (ERROR_SUCCESS != lastErr) {
-				LogError(L"Failed ReadFileEx with lastErr %lu (0x%08lx)", lastErr, lastErr);
-				// TODO: make this better
-				goto error_return;
-			}
-			currentOffset.QuadPart += sourceClusterSize;
-		} else {
-			lastErr = WaitForSingleObjectEx(statsTimer, INFINITE, TRUE);
-			if (WAIT_OBJECT_0 == lastErr) {
-				LogInfo(L"Read: %8.2f MiB of %8.2f MiB; Written: %8.2f\n", (double)g_BytesRead / 1048576.0, sourceFileSizeMiB, (double)g_BytesWritten / 1048576.0);
-				(void)SetWaitableTimer(statsTimer, &statsFreq, 0, NULL, NULL, FALSE);
-			} else if (WAIT_IO_COMPLETION != lastErr) {
-				lastErr = GetLastError();
-				LogError(L"Unexpected WaitForSingleObjectEx return with lastErr %lu (0x%08lx)", lastErr, lastErr);
-				goto error_return;
-			}
-		}
-	}
-
-	/* Wait for all pending IOs complete. */
-	while (g_NumPendingIOs) {
-		lastErr = WaitForSingleObjectEx(statsTimer, INFINITE, TRUE);
-		if (WAIT_OBJECT_0 == lastErr) {
-			LogInfo(L"Read: %8.2f MiB of %8.2f MiB; Written: %8.2f\n", (double)g_BytesRead / 1048576.0, sourceFileSizeMiB, (double)g_BytesWritten / 1048576.0);
-			(void)SetWaitableTimer(statsTimer, &statsFreq, 0, NULL, NULL, FALSE);
-		} else if (WAIT_IO_COMPLETION != lastErr) {
-			lastErr = GetLastError();
-			LogError(L"Unexpected WaitForSingleObjectEx return with lastErr %lu (0x%08lx)", lastErr, lastErr);
+			LogError(L"Failed MapViewOfFile with lastErr %lu (0x%08lx)", lastErr, lastErr);
 			goto error_return;
 		}
+
+		targetViewBase = MapViewOfFile(targetFileMap,
+			FILE_MAP_WRITE,
+			(DWORD)(bytesProcessed >> 32),
+			(DWORD)bytesProcessed,
+			currentMapSize);
+		if (!targetViewBase) {
+			lastErr = GetLastError();
+			LogError(L"Failed MapViewOfFile with lastErr %lu (0x%08lx)", lastErr, lastErr);
+			goto error_return;
+		}
+
+		/* Need to put i here or the compiler will complain since it thinks it
+		 * could be used unitialized in the __except block. It won't be
+		 * uninitialized, but sometimes it's better not to fight the compiler.
+		 */
+		i = 0;
+		__try {
+			for (; i < currentMapAlignedDownSize; i += sizeof(tmpULP)) {
+				/* Assignment to local ensures only a single deref */
+				tmpULP = *(ULONG_PTR *)(sourceViewBase + i);
+				if (tmpULP)
+					*(ULONG_PTR *)(targetViewBase + i) = tmpULP;
+			}
+
+			/* Take care of any remaining data at the end of a view that is
+			 * smaller than a ULONG_PTR */
+			for (; i < currentMapSize; ++i) {
+				/* Assignment to local ensures only a single deref */
+				tmpChar = *(sourceViewBase + i);
+				if (tmpChar)
+					*(targetViewBase + i) = tmpChar;
+			}
+		} __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+		                               ?  EXCEPTION_EXECUTE_HANDLER
+		                               :  EXCEPTION_CONTINUE_SEARCH) {
+			bytesProcessed += i;
+			LogError(L"Failed to read or write to files at offset: %llu", bytesProcessed);
+			goto error_return;
+		}
+
+		bytesProcessed += currentMapSize;
+
+		lastErr = WaitForSingleObject(statsTimer, 0);
+		if (WAIT_OBJECT_0 == lastErr) {
+			LogInfo(L"Copied: %8.2f MiB of %8.2f MiB\n", (double)bytesProcessed / 1048576.0, sourceFileSizeMiB);
+			(void)SetWaitableTimer(statsTimer, &statsFreq, 0, NULL, NULL, FALSE);
+		} else if (WAIT_TIMEOUT != lastErr) {
+			LogError(L"Unexpected WaitForSingleObject return 0x%08lX GetLastError 0x%08lX in wait call for statsTimer\n",
+				lastErr, GetLastError());
+			goto error_return;
+		}
+
+		if (!UnmapViewOfFile(sourceViewBase)) {
+			lastErr = GetLastError();
+			LogError(L"Failed UnmapViewOfFile with lastErr %lu (0x%08lx)", lastErr, lastErr);
+			goto error_return;
+		}
+		sourceViewBase = NULL;
+		if (!UnmapViewOfFile(targetViewBase)) {
+			lastErr = GetLastError();
+			LogError(L"Failed UnmapViewOfFile with lastErr %lu (0x%08lx)", lastErr, lastErr);
+			goto error_return;
+		}
+		targetViewBase = NULL;
 	}
 
+	/* Finished copying file. Start clean up. */
+	(void)CloseHandle(sourceFileMap);
+	sourceFileMap = NULL;
+	(void)CloseHandle(targetFileMap);
+	targetFileMap = NULL;
+
 	/* Set timestamps on target from source file. */
-	if (!SetFileTime(g_TargetFile, &ftCreate, &ftAccess, &ftWrite)) {
+	if (!SetFileTime(targetFile, &ftCreate, &ftAccess, &ftWrite)) {
 		lastErr = GetLastError();
 		LogError(L"Failed to write file time values to target file with lastErr %lu (0x%08lx)\n", lastErr, lastErr);
 	}
 
-	/* Start clean up */
 	(void)CloseHandle(sourceFile);
 	sourceFile = NULL;
 
-	/* Flush buffers on file */
-	if (!FlushFileBuffers(g_TargetFile)) {
+	/* Flush buffers on target file */
+	if (!FlushFileBuffers(targetFile)) {
 		lastErr = GetLastError();
 		LogError(L"WARNING: Failed FlushFileBuffers on target file with lastErr %lu.\n", lastErr);
 	}
 
-	(void)CloseHandle(g_TargetFile);
-	g_TargetFile = NULL;
+	(void)CloseHandle(targetFile);
+	targetFile = NULL;
 
-	LogInfo(L"Sparse file copy complete.\n%16llu bytes read\n%16.2f MiB read\n%16.2f GiB read\n%16llu bytes written\n%16.2f MiB written\n%16.2f GiB written\n",
-	        g_BytesRead,    (double)g_BytesRead    / 1048576.0, (double)g_BytesRead    / 1073741824.0,
-	        g_BytesWritten, (double)g_BytesWritten / 1048576.0, (double)g_BytesWritten / 1073741824.0);
+out_stats:
+	seconds = ElapsedQPCInSeconds(startQPC, GetQPCVal());
+	hours = seconds / (60 * 60);
+	seconds = seconds % (60 * 60);
+	minutes = seconds / 60;
+	seconds = seconds % 60;
 
-	if (g_ClusterMap)
-		ClusterMapPrint(g_ClusterMap, stdout);
+	LogInfo(L"Sparse file copy complete.\n"
+	        L"%llu hours, %llu minutes, %llu seconds.\n"
+	        L"%16llu bytes read\n%16.2f MiB read\n%16.2f GiB read\n",
+	        hours, minutes, seconds,
+	        bytesProcessed, (double)bytesProcessed / 1048576.0, (double)bytesProcessed / 1073741824.0);
 
 	retVal = EXIT_SUCCESS;
 
@@ -471,13 +373,20 @@ error_return:
 	retVal = EXIT_FAILURE;
 
 func_return:
+	if (targetViewBase)
+		(void)UnmapViewOfFile(targetViewBase);
+	if (sourceViewBase)
+		(void)UnmapViewOfFile(sourceViewBase);
+	if (targetFileMap)
+		(void)CloseHandle(targetFileMap);
+	if (sourceFileMap)
+		(void)CloseHandle(sourceFileMap);
 	if (sourceFile)
 		(void)CloseHandle(sourceFile);
-	if (g_TargetFile)
-		(void)CloseHandle(g_TargetFile);
+	if (targetFile)
+		(void)CloseHandle(targetFile);
 	if (statsTimer)
 		(void)CloseHandle(statsTimer);
-	if (g_ClusterMap)
-		ClusterMapFree(g_ClusterMap);
 	return retVal;
 }
+

@@ -53,7 +53,8 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define LogErrorFuncLine(_fmtStr, ...)   LogError(FUNC_LINE_WSTR _fmtStr L"\n", __VA_ARGS__)
 #define LogInfoFuncLine(_fmtStr, ...)    LogInfo(FUNC_LINE_WSTR _fmtStr L"\n", __VA_ARGS__)
 
-#define MAX_PENDING_WRITES      128
+// TODO: Come up with a way to make this dynamic
+#define MAX_PENDING_WRITES      32
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
@@ -81,14 +82,18 @@ AllocWriteOp(
 	struct WriteOp *op;
 
 	if (NULL == (op = calloc(1, sizeof(*op)))) {
-		// suppress unsafe usage warning for _wcserror since we're going to kill the process.
+		// Suppress unsafe usage warning for _wcserror since the usage here is
+		// perfectly safe. _wcserror returns a pointer to a string in a thread
+		// local buffer owned by the CRT. Since we don't pass the returned
+		// pointer back up to the caller it's not going to be modified out
+		// from under them making this usage safe.
 #pragma warning(suppress: 4996)
 		LogErrorFuncLine(L"Memory allocation failure of size %zu with errno %d: %s", sizeof(*op), errno, _wcserror(errno));
 		goto error_return;
 	}
 
 	if (NULL == (op->Buf = _aligned_malloc(BufSz, PAGE_SIZE))) {
-		// suppress unsafe usage warning for _wcserror since we're going to kill the process.
+		// suppress unsafe usage warning for _wcserror as explained above.
 #pragma warning(suppress: 4996)
 		LogErrorFuncLine(L"Memory allocation failure of size %zu with errno %d: %s", BufSz, errno, _wcserror(errno));
 		goto error_return;
@@ -116,6 +121,39 @@ func_return:
 
 	return op;
 }
+
+
+_Ret_notnull_
+__declspec(restrict)
+static struct WriteOp *
+AllocWriteOpOrDie(
+	_In_        size_t      BufSz
+	)
+{
+	struct WriteOp *op;
+	int i;
+
+	op = AllocWriteOp(BufSz);
+	if (op)
+		goto func_return;
+
+	// Retry a few times before we hard fail.
+	for (i = 0; !op; ++i) {
+		LogErrorFuncLine(L"Failed AllocWriteOp() %d times", i + 1);
+		if (4 >= i) {
+			LogErrorFuncLine(L"Failed AllocWriteOp() too many times. Aborting.");
+			ExitProcess(EXIT_FAILURE);
+		}
+		// Sleep for at least a clock tick to allow resources to free up.
+		Sleep(16);
+		LogErrorFuncLine(L"Retrying AllocWriteOp()");
+		op = AllocWriteOp(BufSz);
+	}
+
+func_return:
+	return op;
+}
+
 
 static void
 FreeWriteOp(
@@ -239,6 +277,8 @@ int wmain(
 	struct CleanupThreadParams  *tParams;
 	struct WriteOp              *curWriteOp;
 
+	SparseFileLibInit();
+
 	if (2 != argc) {
 		LogErrorFuncLine(L"Invalid command line parameters");
 		ExitProcess(EXIT_FAILURE);
@@ -304,7 +344,7 @@ int wmain(
 
 	tParams = calloc(1, sizeof(*tParams));
 	if (NULL == tParams) {
-		// suppress unsafe usage warning for _wcserror since we're going to kill the process.
+		// suppress unsafe usage warning for _wcserror as explained above.
 #pragma warning(suppress: 4996)
 		LogErrorFuncLine(L"Memory allocation failure of size %zu with errno %d: %s", sizeof(*tParams), errno, _wcserror(errno));
 		ExitProcess(EXIT_FAILURE);
@@ -331,11 +371,7 @@ int wmain(
 	curWriteOp    = NULL;
 	do {
 		if (!curWriteOp) {
-			curWriteOp = AllocWriteOp((size_t)fsClusterSize);
-			if (!curWriteOp) {
-				LogErrorFuncLine(L"Failed AllocWriteOp()");
-				ExitProcess(EXIT_FAILURE);
-			}
+			curWriteOp = AllocWriteOpOrDie((size_t)fsClusterSize);
 		}
 
 		bytsRd = FillBuf(stdInHndl, curWriteOp->Buf, (DWORD)curWriteOp->BufSz);

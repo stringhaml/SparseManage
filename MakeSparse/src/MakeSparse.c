@@ -66,7 +66,7 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /* TODO: Query existing sparse ranges and don't re-analyze them. */
 
 /* TODO: Make this dynamic */
-#define MAX_PENDING_IO              128
+#define MAX_PENDING_IO              32
 
 /* This value will be used if the cluster size of the filesystem cannot be
  * determined automatically. */
@@ -624,6 +624,8 @@ wmain(
 	DWORD                       errRet;
 	PCLUSTER_MAP                zeroClusterMap;
 
+	SparseFileLibInit();
+
 	memset(&ioCbShared, 0, sizeof(ioCbShared));
 
 	if (ParseCommandLine(argc, argv, &invocationName, &prsvTm, &printSparseMap, &flName)) {
@@ -634,7 +636,7 @@ wmain(
 	LogInfo(L"Opening file %s\n", flName);
 
 	fl = OpenFileExclusive(flName,
-	                       FILE_FLAG_OVERLAPPED,
+	                       FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
 	                       &flSz,
 	                       &fsClusterSize,
 	                       &tmCrt,

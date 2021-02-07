@@ -36,6 +36,12 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <windows.h>
 
+// This function **must** be called before using any of these functions.
+void __stdcall
+SparseFileLibInit(
+	void
+	);
+
 void __cdecl
 LogError(
 	_In_        LPCWSTR         FormatString,
@@ -132,7 +138,77 @@ SetFileSize(
 	_In_        LARGE_INTEGER   NewFileSize
 	);
 
+UINT64 __stdcall
+GetQPCVal(
+	void
+	);
 
+UINT64 __stdcall
+ElapsedQPCInHours(
+	_In_ UINT64 StartVal,
+	_In_ UINT64 EndVal
+	);
+
+UINT64 __stdcall
+ElapsedQPCInMinutes(
+	_In_ UINT64 StartVal,
+	_In_ UINT64 EndVal
+	);
+
+UINT64 __stdcall
+ElapsedQPCInSeconds(
+	_In_ UINT64 StartVal,
+	_In_ UINT64 EndVal
+	);
+
+UINT64 __stdcall
+ElapsedQPCInMillisec(
+	_In_ UINT64 StartVal,
+	_In_ UINT64 EndVal
+	);
+
+UINT64 __stdcall
+ElapsedQPCInMicrosec(
+	_In_ UINT64 StartVal,
+	_In_ UINT64 EndVal
+	);
+
+UINT64 __stdcall
+ElapsedQPCInNanosec(
+	_In_ UINT64 StartVal,
+	_In_ UINT64 EndVal
+	);
+
+/* Utility macros. For some reason these macros aren't defined in windows.h
+ * and instead are only available in the WDK headers so we need to define
+ * them here if they are not already defined. */
+#ifndef SPARSEFILELIB_DONT_DEFINE_UTIL_MACROS
+#ifndef ALIGN_DOWN_POINTER_BY
+#define ALIGN_DOWN_POINTER_BY(address, alignment) \
+    ((PVOID)((ULONG_PTR)(address) & ~((ULONG_PTR)(alignment) - 1)))
+#endif
+#ifndef ALIGN_UP_POINTER_BY
+#define ALIGN_UP_POINTER_BY(address, alignment) \
+    (ALIGN_DOWN_POINTER_BY(((ULONG_PTR)(address) + (alignment) - 1), alignment))
+#endif
+#ifndef ALIGN_DOWN_POINTER
+#define ALIGN_DOWN_POINTER(address, type) \
+    ALIGN_DOWN_POINTER_BY(address, sizeof(type))
+#endif
+#ifndef ALIGN_UP_POINTER
+#define ALIGN_UP_POINTER(address, type) \
+    ALIGN_UP_POINTER_BY(address, sizeof(type))
+#endif
+#ifndef ALIGN_DOWN_BY
+#define ALIGN_DOWN_BY(size, align)   ((ULONG_PTR)(size) & ~((ULONG_PTR)(align) - 1))
+#endif
+#ifndef MIN
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+#endif
+#ifndef MAX
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
+#endif
+#endif
 
 #endif // SPARSEFILELIB_H
 
