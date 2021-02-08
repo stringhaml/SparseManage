@@ -201,11 +201,11 @@ wmain(
 		goto out_stats;
 
 	sourceFileMap = CreateFileMappingW(sourceFile,
-		NULL,
-		PAGE_READONLY,
-		0,
-		0,
-		NULL);
+	                                   NULL,
+	                                   PAGE_READONLY,
+	                                   0,
+	                                   0,
+	                                   NULL);
 	if (!sourceFileMap) {
 		lastErr = GetLastError();
 		LogError(L"Failed CreateFileMappingW with lastErr %lu (0x%08lx)", lastErr, lastErr);
@@ -213,11 +213,11 @@ wmain(
 	}
 
 	targetFileMap = CreateFileMappingW(targetFile,
-		NULL,
-		PAGE_READWRITE,
-		0,
-		0,
-		NULL);
+	                                   NULL,
+	                                   PAGE_READWRITE,
+	                                   0,
+	                                   0,
+	                                   NULL);
 	if (!targetFileMap) {
 		lastErr = GetLastError();
 		LogError(L"Failed CreateFileMappingW with lastErr %lu (0x%08lx)", lastErr, lastErr);
@@ -252,10 +252,10 @@ wmain(
 		currentMapAlignedDownSize = ALIGN_DOWN_BY(currentMapSize, sizeof(tmpULP));
 
 		sourceViewBase = MapViewOfFile(sourceFileMap,
-			FILE_MAP_READ,
-			(DWORD)(bytesProcessed >> 32),
-			(DWORD)bytesProcessed,
-			currentMapSize);
+		                               FILE_MAP_READ,
+		                               (DWORD)(bytesProcessed >> 32),
+		                               (DWORD)bytesProcessed,
+		                               currentMapSize);
 		if (!sourceViewBase) {
 			lastErr = GetLastError();
 			LogError(L"Failed MapViewOfFile with lastErr %lu (0x%08lx)", lastErr, lastErr);
@@ -263,10 +263,10 @@ wmain(
 		}
 
 		targetViewBase = MapViewOfFile(targetFileMap,
-			FILE_MAP_WRITE,
-			(DWORD)(bytesProcessed >> 32),
-			(DWORD)bytesProcessed,
-			currentMapSize);
+		                               FILE_MAP_WRITE,
+		                               (DWORD)(bytesProcessed >> 32),
+		                               (DWORD)bytesProcessed,
+		                               currentMapSize);
 		if (!targetViewBase) {
 			lastErr = GetLastError();
 			LogError(L"Failed MapViewOfFile with lastErr %lu (0x%08lx)", lastErr, lastErr);

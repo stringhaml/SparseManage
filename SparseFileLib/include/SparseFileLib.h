@@ -138,6 +138,16 @@ SetFileSize(
 	_In_        LARGE_INTEGER   NewFileSize
 	);
 
+_Success_(return == TRUE)
+BOOL __stdcall
+BuildSparseMap(
+	_In_ HANDLE File,
+	_In_opt_ FILE *const StatsStream,
+	_In_opt_ UINT64 StatsFrequencyMillisec,
+	_Inout_opt_ SIZE_T *ClusterSize,
+	_Out_ PCLUSTER_MAP *ClusterMap
+	);
+
 UINT64 __stdcall
 GetQPCVal(
 	void

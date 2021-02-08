@@ -190,10 +190,11 @@ ClusterMapIsMarkedZero(
 	UINT64          Cluster
 	)
 {
-	// Cluster / 32 finds the index in the map and then we read the value there.
-	// 1 << (Cluster & 31) creates the bitmask to use to check if the bit is set in the value read.
-	// & checks if just that bit is set
-	// the !! forces exactly 0 or 1 to be returned rather than using a conditional to do it.
+	/* (Cluster / 32) finds the dword in the map where the bit is stored.
+	 * (1 << (Cluster & 31)) creates the bitmask to extract the bit we want.
+	 * & extracts just the bit we care about.
+	 * !! forces exactly 0 or 1 to be returned without using a conditional.
+	**/
 	return !!(*(ClusterMap->ClusterMap + (Cluster / 32)) & (1 << (Cluster & 31)));
 }
 
@@ -272,7 +273,8 @@ GetVolumeClusterSizeFromFileHandle(
 	ofst = flName;
 	delimCnt = 0;
 	while (delimCnt < 4 && *ofst != L'\0') {
-		if (*ofst == L'\\') delimCnt++;
+		if (*ofst == L'\\')
+			delimCnt++;
 		ofst = CharNextW(ofst);
 	}
 
@@ -392,6 +394,227 @@ SetFileSize(
 
 func_return:
 	return lastErr;
+}
+
+
+#define MAX_FILE_VIEW_SIZE (512 * 1024 * 1024)
+
+
+/* TODO: Query existing sparse ranges and don't re-analyze them. */
+_Success_(return == TRUE)
+BOOL __stdcall
+BuildSparseMap(
+	_In_ HANDLE File,
+	_In_opt_ FILE * const StatsStream,
+	_In_opt_ UINT64 StatsFrequencyMillisec,
+	_Inout_opt_ SIZE_T *ClusterSize,
+	_Out_ PCLUSTER_MAP *ClusterMap
+	)
+{
+	SIZE_T fsClusterSize;
+	BOOL retVal;
+	UINT64 bytesProcessed, numSparseClusters, startQPC, lastStatQPC;
+	LARGE_INTEGER tmpLI;
+	UINT64 flSize, hours, minutes, seconds;
+	HANDLE flMap;
+	SIZE_T currentViewSize, currentViewAlignedDownSize, i, startClusterOfst,
+	       sequentialZeros;
+	char *currentViewBase;
+	PCLUSTER_MAP clusterMap;
+	DWORD lastErr;
+	double flSizeMiB;
+
+	lastErr = 0;
+	fsClusterSize = 0;
+	retVal = FALSE;
+	bytesProcessed = 0;
+	flMap = NULL;
+	currentViewBase = NULL;
+	clusterMap = NULL;
+	numSparseClusters = 0;
+
+	startQPC = GetQPCVal();
+	lastStatQPC = startQPC;
+
+	if (NULL == ClusterSize || 0 == *ClusterSize) {
+		fsClusterSize = (DWORD)GetVolumeClusterSizeFromFileHandle(File);
+		if (!fsClusterSize) {
+			lastErr = GetLastError();
+			goto error_return;
+		}
+		if (ClusterSize)
+			*ClusterSize = fsClusterSize;
+	} else {
+		fsClusterSize = *ClusterSize;
+	}
+
+	// Ensure the cluster size is a power of two and a reasonable size.
+	if ((512 > fsClusterSize) || (fsClusterSize & (fsClusterSize - 1))) {
+		lastErr = ERROR_INVALID_PARAMETER;
+		goto error_return;
+	}
+
+	if (FALSE == GetFileSizeEx(File, &tmpLI))
+		goto error_return;
+
+	flSize = (UINT64)tmpLI.QuadPart;
+	if (!flSize) {
+		lastErr = ERROR_FILE_INVALID;
+		goto error_return;
+	}
+	flSizeMiB = (double)flSize / (double)(1024 * 1024);
+
+	clusterMap = ClusterMapAllocate((DWORD)fsClusterSize, flSize);
+	if (!clusterMap) {
+		lastErr = GetLastError();
+		goto error_return;
+	}
+
+	flMap = CreateFileMappingW(File,
+	                           NULL,
+	                           PAGE_READONLY,
+	                           0,
+	                           0,
+	                           NULL);
+	if (!flMap) {
+		lastErr = GetLastError();
+		//LogError(L"Failed CreateFileMappingW with lastErr %lu (0x%08lx)", lastErr, lastErr);
+		goto error_return;
+	}
+
+	while (bytesProcessed < flSize) {
+		currentViewSize = (SIZE_T)MIN(MAX_FILE_VIEW_SIZE, flSize - bytesProcessed);
+		currentViewAlignedDownSize = ALIGN_DOWN_BY(currentViewSize, sizeof(ULONG_PTR));
+		currentViewBase = MapViewOfFile(flMap,
+		                                FILE_MAP_READ,
+		                                (DWORD)(bytesProcessed >> 32),
+		                                (DWORD)bytesProcessed,
+		                                currentViewSize);
+		if (!currentViewBase) {
+			lastErr = GetLastError();
+			//LogError(L"Failed MapViewOfFile with lastErr %lu (0x%08lx)", lastErr, lastErr);
+			goto error_return;
+		}
+
+		__try {
+			i = 0;
+			startClusterOfst = 0;
+			while (i < currentViewAlignedDownSize) {
+				if (*(ULONG_PTR *)(currentViewBase + i)) {
+					sequentialZeros = (i - startClusterOfst);
+					// Mark any detected sparse ranges.
+					while (sequentialZeros >= fsClusterSize) {
+						ClusterMapMarkZero(clusterMap, bytesProcessed + startClusterOfst);
+						numSparseClusters++;
+						sequentialZeros -= fsClusterSize;
+						startClusterOfst += fsClusterSize;
+					}
+					i = ALIGN_DOWN_BY((i + fsClusterSize), fsClusterSize);
+					startClusterOfst = i;
+				} else {
+					i += sizeof(ULONG_PTR);
+				}
+			}
+
+			/* Take care of any remaining data at the end of a view that is
+			 * smaller than a ULONG_PTR */
+			while (i < currentViewSize) {
+				if (*(currentViewBase + i)) {
+					sequentialZeros = (i - startClusterOfst);
+					// Mark any detected sparse ranges.
+					while (sequentialZeros >= fsClusterSize) {
+						ClusterMapMarkZero(clusterMap, bytesProcessed + startClusterOfst);
+						numSparseClusters++;
+						sequentialZeros -= fsClusterSize;
+						startClusterOfst += fsClusterSize;
+					}
+					i = currentViewSize;
+				} else {
+					++i;
+				}
+			}
+
+			/* Handle zero ranges up to the the end of the file view. */
+			if (i == currentViewSize && (startClusterOfst < i) ) {
+				sequentialZeros = (i - startClusterOfst);
+				// Mark any detected sparse ranges including a final partial
+				// cluster.
+				do {
+					ClusterMapMarkZero(clusterMap, bytesProcessed + startClusterOfst);
+					numSparseClusters++;
+					startClusterOfst += fsClusterSize;
+					sequentialZeros -= MIN(fsClusterSize, sequentialZeros);
+				} while (sequentialZeros);
+			}
+
+		} __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+		                               ?  EXCEPTION_EXECUTE_HANDLER
+		                               :  EXCEPTION_CONTINUE_SEARCH) {
+			//LogError(L"Failed to read or write to files at offset: %llu", bytesProcessed);
+			lastErr = ERROR_FILE_INVALID;
+			goto error_return;
+		}
+
+		bytesProcessed += currentViewSize;
+
+		if (StatsStream) {
+			if (ElapsedQPCInMillisec(lastStatQPC, GetQPCVal()) >= StatsFrequencyMillisec) {
+				fwprintf(StatsStream,
+				         L"Analyzed: %8.2f MiB of %8.2f MiB. %8.2f MiB of sparse ranges found.\n",
+				         (double)bytesProcessed / 1048576.0,
+				         flSizeMiB,
+				         (double)(numSparseClusters * fsClusterSize) / 1048576.0);
+				lastStatQPC = GetQPCVal();
+			}
+		}
+
+		if (!UnmapViewOfFile(currentViewBase)) {
+			lastErr = GetLastError();
+			//LogError(L"Failed UnmapViewOfFile with lastErr %lu (0x%08lx)", lastErr, lastErr);
+			goto error_return;
+		}
+		currentViewBase = NULL;
+	}
+
+	if (!CloseHandle(flMap)) {
+		lastErr = GetLastError();
+		goto error_return;
+	}
+
+	*ClusterMap = clusterMap;
+
+	if (StatsStream) {
+		seconds = ElapsedQPCInSeconds(startQPC, GetQPCVal());
+		hours = seconds / (60 * 60);
+		seconds = seconds % (60 * 60);
+		minutes = seconds / 60;
+		seconds = seconds % 60;
+
+		fwprintf(StatsStream,
+		        L"Analyzed: %8.2f MiB of %8.2f MiB. %8.2f MiB of zero ranges found.\n"
+		        L"Elapsed time: %llu hours, %llu minutes, %llu seconds\n",
+		        (double)bytesProcessed / 1048576.0,
+		        flSizeMiB,
+		        (double)(numSparseClusters * fsClusterSize) / 1048576.0,
+		        hours, minutes, seconds);
+	}
+
+	retVal = TRUE;
+	goto func_return;
+
+error_return:
+	if (currentViewBase)
+		(void)UnmapViewOfFile(currentViewBase);
+	if (flMap)
+		(void)CloseHandle(flMap);
+	if (clusterMap)
+		ClusterMapFree(clusterMap);
+
+	retVal = FALSE;
+	SetLastError(lastErr);
+
+func_return:
+	return retVal;
 }
 
 
